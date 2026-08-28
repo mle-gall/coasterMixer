@@ -43,6 +43,7 @@ CLASSES = (
     CoasterMixerBlockGroup,
     CoasterMixerConnection,
     CoasterMixerFollowerSettings,
+    CoasterMixerCameraSettings,
     CoasterMixerTrackSettings,
     CoasterMixerSceneSettings,
     COASTERMIXER_UL_zones,
@@ -81,6 +82,7 @@ CLASSES = (
     COASTERMIXER_PT_piece,
     COASTERMIXER_PT_connections,
     COASTERMIXER_PT_train,
+    COASTERMIXER_PT_camera,
     COASTERMIXER_PT_simulation,
     COASTERMIXER_PT_blocks,
     COASTERMIXER_PT_setup_utilities,
@@ -93,6 +95,7 @@ def register():
 
     bpy.types.Object.coaster_mixer_track = bpy.props.PointerProperty(type=CoasterMixerTrackSettings)
     bpy.types.Object.coaster_mixer_follower = bpy.props.PointerProperty(type=CoasterMixerFollowerSettings)
+    bpy.types.Object.coaster_mixer_camera = bpy.props.PointerProperty(type=CoasterMixerCameraSettings)
     bpy.types.Scene.coaster_mixer_scene = bpy.props.PointerProperty(type=CoasterMixerSceneSettings)
     bpy.types.NODE_MT_add.append(draw_control_node_add_menu)
     ensure_driver_namespace()
@@ -115,6 +118,7 @@ def unregister():
     remove_driver_namespace()
     clear_runtime_caches()
     del bpy.types.Scene.coaster_mixer_scene
+    del bpy.types.Object.coaster_mixer_camera
     del bpy.types.Object.coaster_mixer_follower
     del bpy.types.Object.coaster_mixer_track
 

@@ -4,7 +4,7 @@
 import bpy
 import gpu
 from bisect import bisect_left, bisect_right
-from math import log1p, pi, tau
+from math import log1p, pi, sin, tau
 from time import perf_counter
 from mathutils import Matrix, Quaternion, Vector
 from mathutils.geometry import interpolate_bezier
@@ -2025,12 +2025,14 @@ def remove_follower_drivers(empty_object):
 
 
 def collect_track_followers(track_object):
+    driven_empty_object = track_object.coaster_mixer_track.driven_empty_object
     followers = [
         object_ref
         for object_ref in bpy.data.objects
         if (
             object_ref.type == "EMPTY"
             and object_ref.coaster_mixer_follower.track_object == track_object
+            and object_ref != driven_empty_object
             and not object_ref.get("coaster_mixer_camera_target", False)
         )
     ]
@@ -2050,10 +2052,91 @@ def collect_track_placement_objects(track_object):
     ]
 
 
-def place_ride_cameras(track_object, placement_by_object):
-    """Aim cameras at their look-ahead target while preserving mount bank."""
+def collect_ride_cameras(track_object):
+    """Return cameras authored by Coaster Mixer for this root track."""
+    cameras = []
     for camera_object in bpy.data.objects:
-        if camera_object.type != "CAMERA" or camera_object.parent is None:
+        if camera_object.type != "CAMERA":
+            continue
+        camera_settings = getattr(camera_object, "coaster_mixer_camera", None)
+        if camera_settings is not None and camera_settings.track_object == track_object:
+            cameras.append(camera_object)
+            continue
+        if camera_object.parent is None or camera_object.parent.type != "EMPTY":
+            continue
+        aim_constraint = camera_object.constraints.get("Coaster Mixer Look Ahead")
+        if aim_constraint is not None and camera_object.parent.coaster_mixer_follower.track_object == track_object:
+            # Migrate cameras created before dedicated camera settings existed.
+            if camera_settings is not None and camera_settings.track_object is None:
+                target_object = aim_constraint.target
+                mount_offset = camera_object.parent.coaster_mixer_follower.offset_meters
+                target_offset = (
+                    target_object.coaster_mixer_follower.offset_meters
+                    if target_object is not None and target_object.type == "EMPTY"
+                    else mount_offset - 5.0
+                )
+                assign_rna_property(camera_settings, "track_object", track_object)
+                assign_rna_property(camera_settings, "mount_object", camera_object.parent)
+                if target_object is not None and target_object.type == "EMPTY":
+                    assign_rna_property(camera_settings, "target_object", target_object)
+                assign_rna_property(camera_settings, "offset_xyz", tuple(camera_object.location))
+                assign_rna_property(
+                    camera_settings,
+                    "look_ahead_meters",
+                    max(mount_offset - target_offset, 0.1),
+                )
+                assign_rna_property(
+                    camera_settings,
+                    "target_vertical_offset_meters",
+                    camera_object.location.z,
+                )
+            cameras.append(camera_object)
+    cameras.sort(key=lambda camera_object: camera_object.name)
+    return cameras
+
+
+def get_camera_shake_offset(track_object, camera_object, mount_rotation, route, front_meters):
+    """Return deterministic, local camera jitter driven by speed and track load."""
+    camera_settings = getattr(camera_object, "coaster_mixer_camera", None)
+    if camera_settings is None or not camera_settings.shake_enabled:
+        return Vector((0.0, 0.0, 0.0))
+
+    scene = getattr(bpy.context, "scene", None)
+    scene_settings = getattr(scene, "coaster_mixer_scene", None)
+    speed = 0.0
+    if scene_settings is not None and scene_settings.track_object == track_object:
+        speed = max(scene_settings.simulation_current_speed_mps, 0.0)
+    if speed <= SIMULATION_STOP_EPSILON:
+        return Vector((0.0, 0.0, 0.0))
+
+    curvature_acceleration = sample_route_curvature_vector(route, front_meters) * (speed * speed)
+    mount_side = mount_rotation @ Vector((1.0, 0.0, 0.0))
+    mount_up = mount_rotation @ Vector((0.0, 0.0, 1.0))
+    lateral_g = abs(curvature_acceleration.dot(mount_side)) / GRAVITY_ACCELERATION
+    apparent_acceleration = curvature_acceleration - Vector((0.0, 0.0, -GRAVITY_ACCELERATION))
+    vertical_g = abs(apparent_acceleration.dot(mount_up)) / GRAVITY_ACCELERATION
+    load_change = abs(vertical_g - 1.0)
+
+    amplitude = camera_settings.shake_factor * (
+        0.006 * clamp(speed / 25.0, 0.0, 2.0)
+        + 0.004 * clamp(lateral_g, 0.0, 3.0)
+        + 0.003 * clamp(load_change, 0.0, 3.0)
+    )
+    amplitude = min(amplitude, 0.08)
+    phase = front_meters
+    return Vector(
+        (
+            amplitude * (0.65 * sin(phase * 19.7) + 0.35 * sin(phase * 43.1 + 0.8)),
+            amplitude * 0.35 * sin(phase * 31.3 + 2.1),
+            amplitude * (0.7 * sin(phase * 23.9 + 1.4) + 0.3 * sin(phase * 52.7)),
+        )
+    )
+
+
+def place_ride_cameras(track_object, placement_by_object, route, front_meters):
+    """Aim cameras at their look-ahead target while preserving mount bank."""
+    for camera_object in collect_ride_cameras(track_object):
+        if camera_object.parent is None:
             continue
         aim_constraint = camera_object.constraints.get("Coaster Mixer Look Ahead")
         if aim_constraint is None or aim_constraint.target is None:
@@ -2069,6 +2152,16 @@ def place_ride_cameras(track_object, placement_by_object):
         aim_constraint.influence = 0.0
         mount_location, mount_rotation = mount_sample
         target_location, _target_rotation = target_sample
+        camera_settings = getattr(camera_object, "coaster_mixer_camera", None)
+        if camera_settings is not None and camera_settings.track_object == track_object:
+            base_offset = Vector(camera_settings.offset_xyz)
+            camera_object.location = base_offset + get_camera_shake_offset(
+                track_object,
+                camera_object,
+                mount_rotation,
+                route,
+                front_meters,
+            )
         camera_location = mount_location + mount_rotation @ camera_object.location
         forward = target_location - camera_location
         if forward.length_squared <= 1.0e-10:
@@ -2117,10 +2210,12 @@ def place_track_followers(track_object, front_meters=None):
             samples_by_offset[offset] = sample
         if follower_object.rotation_mode != "XYZ":
             follower_object.rotation_mode = "XYZ"
-        follower_object.location = sample[0]
+        vertical_offset = follower_object.coaster_mixer_follower.vertical_offset_meters
+        follower_location = sample[0] + sample[1] @ Vector((0.0, 0.0, vertical_offset))
+        follower_object.location = follower_location
         follower_object.rotation_euler = sample[2]
-        placement_by_object[follower_object.as_pointer()] = (sample[0], sample[1])
-    place_ride_cameras(track_object, placement_by_object)
+        placement_by_object[follower_object.as_pointer()] = (follower_location, sample[1])
+    place_ride_cameras(track_object, placement_by_object, route, front_meters)
 
 
 def ensure_driven_empty_path_setup(track_object, track_settings):
@@ -3071,4 +3166,3 @@ def control_template_items_callback(owner, context):
     if has_any_brake:
         allowed.add("TRIM_BRAKE")
     return [item for item in CONTROL_TEMPLATE_ITEMS if item[0] in allowed]
-

@@ -635,7 +635,40 @@ class COASTERMIXER_PT_train(CoasterMixerPanelMixin, bpy.types.Panel):
         button_row = follower_box.row(align=True)
         button_row.operator("coaster_mixer.create_train_followers", text="Create Cars", icon="OUTLINER_OB_EMPTY")
         button_row.operator("coaster_mixer.attach_selected_followers", text="Attach Selected", icon="LINKED")
-        follower_box.operator("coaster_mixer.create_train_camera", text="Create Ride Camera", icon="OUTLINER_OB_CAMERA")
+
+
+class COASTERMIXER_PT_camera(CoasterMixerPanelMixin, bpy.types.Panel):
+    bl_label = "Ride Cameras"
+    bl_idname = "COASTERMIXER_PT_camera"
+    bl_parent_id = "COASTERMIXER_PT_train"
+
+    @classmethod
+    def poll(cls, context):
+        return resolve_active_track_object(context) is not None
+
+    def draw(self, context):
+        layout = self.layout
+        track_object = resolve_active_track_object(context)
+        cameras = collect_ride_cameras(track_object)
+        if not cameras:
+            layout.label(text="No ride camera created yet.")
+        for camera_object in cameras:
+            camera_box = layout.box()
+            camera_box.label(text=camera_object.name, icon="OUTLINER_OB_CAMERA")
+            settings = camera_object.coaster_mixer_camera
+            column = camera_box.column()
+            column.use_property_split = True
+            column.use_property_decorate = False
+            column.prop(settings, "mount_object")
+            column.prop(settings, "offset_xyz")
+            column.prop(camera_object.data, "lens")
+            column.prop(settings, "look_ahead_meters")
+            column.prop(settings, "target_vertical_offset_meters")
+            column.prop(settings, "shake_enabled")
+            shake_column = column.column()
+            shake_column.enabled = settings.shake_enabled
+            shake_column.prop(settings, "shake_factor")
+        layout.operator("coaster_mixer.create_train_camera", text="Create Ride Camera", icon="OUTLINER_OB_CAMERA")
 
 
 class COASTERMIXER_PT_simulation(CoasterMixerPanelMixin, bpy.types.Panel):
@@ -751,4 +784,3 @@ class COASTERMIXER_PT_setup_utilities(CoasterMixerPanelMixin, bpy.types.Panel):
             text="Clear / Reset Curve Setup…",
             icon="FILE_REFRESH",
         )
-

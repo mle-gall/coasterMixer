@@ -924,6 +924,14 @@ class COASTERMIXER_OT_create_train_camera(bpy.types.Operator):
         aim_constraint.up_axis = "UP_Y"
         aim_constraint.influence = 0.0
 
+        camera_settings = camera_object.coaster_mixer_camera
+        camera_settings.track_object = track_object
+        camera_settings.mount_object = mount_object
+        camera_settings.target_object = target_object
+        camera_settings.offset_xyz = (0.0, 0.0, self.height_meters)
+        camera_settings.look_ahead_meters = self.look_ahead_meters
+        camera_settings.target_vertical_offset_meters = self.height_meters
+
         if self.make_active:
             context.scene.camera = camera_object
 
@@ -1309,4 +1317,3 @@ class COASTERMIXER_OT_select_piece(bpy.types.Operator):
         context.view_layer.objects.active = piece
         tag_redraw_view3d()
         return {"FINISHED"}
-

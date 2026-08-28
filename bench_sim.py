@@ -26,6 +26,7 @@ import time
 from pathlib import Path
 
 import bpy
+from mathutils import Vector
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ADDON_SOURCE_PATHS = tuple(sorted((SCRIPT_DIR / "coaster_mixer").glob("*.py")))
@@ -273,6 +274,15 @@ def build_scene(addon):
         bpy.context.collection.objects.link(empty)
         addon.ensure_follower_drivers(piece_a, empty, offset_meters=1.5 * index)
 
+    result = bpy.ops.coaster_mixer.create_train_camera(
+        "EXEC_DEFAULT",
+        height_meters=1.6,
+        look_ahead_meters=5.0,
+        lens_millimeters=35.0,
+        make_active=True,
+    )
+    assert result == {"FINISHED"}, f"ride camera creation failed: {result}"
+
     route = addon.get_resolved_route(piece_a)
     expected_pieces = MIDDLE_PIECE_COUNT + 2
     assert route["cyclic"], "expected a closed circuit"
@@ -281,6 +291,38 @@ def build_scene(addon):
     )
     assert route["entries"][-1]["reversed"], "expected piece B to be traversed reversed"
     return piece_a, scene_settings
+
+
+def check_camera_rig(addon, track_object, scene_settings):
+    cameras = addon.collect_ride_cameras(track_object)
+    assert len(cameras) == 1, f"expected one ride camera, got {len(cameras)}"
+    camera_object = cameras[0]
+    settings = camera_object.coaster_mixer_camera
+    followers = addon.collect_track_followers(track_object)
+    assert settings.mount_object == followers[1], "camera should initially mount to the second car"
+    assert settings.target_object is not None, "camera target follower is missing"
+    assert abs(settings.target_object.coaster_mixer_follower.vertical_offset_meters - 1.6) <= 1.0e-6
+
+    settings.mount_object = followers[3]
+    expected_target_offset = followers[3].coaster_mixer_follower.offset_meters - settings.look_ahead_meters
+    actual_target_offset = settings.target_object.coaster_mixer_follower.offset_meters
+    assert abs(actual_target_offset - expected_target_offset) <= 1.0e-6, (
+        "camera target did not preserve its look-ahead distance after changing cars"
+    )
+
+    settings.offset_xyz = (0.25, -0.1, 1.7)
+    settings.target_vertical_offset_meters = 1.7
+    settings.shake_enabled = True
+    scene_settings.simulation_current_speed_mps = 20.0
+    addon.place_track_followers(track_object, 120.0)
+    assert (camera_object.location - Vector(settings.offset_xyz)).length > 1.0e-7, (
+        "enabled camera shake did not move the camera"
+    )
+    settings.shake_enabled = False
+    addon.place_track_followers(track_object, 120.0)
+    assert (camera_object.location - Vector(settings.offset_xyz)).length <= 1.0e-7, (
+        "disabled camera shake should restore the authored offset"
+    )
 
 
 def run_live_loop(addon, scene_settings, per_frame_invalidation):
@@ -530,6 +572,7 @@ def main():
 
     results = {"label": label}
     check_ui_statics(addon)
+    check_camera_rig(addon, track_object, scene_settings)
     results.update(bench_live_playback(addon, scene_settings))
     results.update(check_scrub_and_loop(addon, scene_settings, track_object))
     bake_stats, values = bench_bake(addon, track_object)

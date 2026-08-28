@@ -621,6 +621,125 @@ class CoasterMixerFollowerSettings(bpy.types.PropertyGroup):
         default=0.0,
         update=follower_settings_update,
     )
+    vertical_offset_meters: bpy.props.FloatProperty(
+        name="Vertical Offset",
+        description="Local height above the sampled track position",
+        subtype="DISTANCE",
+        default=0.0,
+        update=follower_settings_update,
+    )
+
+
+def is_camera_mount_object(settings, obj):
+    return bool(
+        obj is not None
+        and obj.type == "EMPTY"
+        and settings.track_object is not None
+        and obj.coaster_mixer_follower.track_object == settings.track_object
+        and obj != settings.track_object.coaster_mixer_track.driven_empty_object
+        and not obj.get("coaster_mixer_camera_target", False)
+    )
+
+
+def camera_settings_update(settings, _context):
+    camera_object = settings.id_data
+    if camera_object is None or camera_object.type != "CAMERA":
+        return
+    mount_object = settings.mount_object
+    if (
+        mount_object is not None
+        and mount_object.type == "EMPTY"
+        and mount_object.coaster_mixer_follower.track_object == settings.track_object
+    ):
+        camera_object.parent = mount_object
+    target_object = settings.target_object
+    if target_object is not None and target_object.type == "EMPTY":
+        target_settings = target_object.coaster_mixer_follower
+        if target_settings.track_object != settings.track_object:
+            assign_rna_property(target_settings, "track_object", settings.track_object)
+        mount_offset = (
+            mount_object.coaster_mixer_follower.offset_meters
+            if mount_object is not None
+            and mount_object.type == "EMPTY"
+            and mount_object.coaster_mixer_follower.track_object == settings.track_object
+            else 0.0
+        )
+        desired_offset = mount_offset - settings.look_ahead_meters
+        if values_differ(target_settings.offset_meters, desired_offset):
+            assign_rna_property(target_settings, "offset_meters", desired_offset)
+        if values_differ(target_settings.vertical_offset_meters, settings.target_vertical_offset_meters):
+            assign_rna_property(
+                target_settings,
+                "vertical_offset_meters",
+                settings.target_vertical_offset_meters,
+            )
+    track_object = settings.track_object
+    if track_object is not None and track_object.type == "CURVE":
+        place_track_followers(track_object)
+        refresh_view_layer()
+    tag_redraw_view3d()
+
+
+class CoasterMixerCameraSettings(bpy.types.PropertyGroup):
+    track_object: bpy.props.PointerProperty(
+        name="Track",
+        description="Root coaster track driven by this ride camera",
+        type=bpy.types.Object,
+        poll=is_curve_object,
+        update=camera_settings_update,
+    )
+    target_object: bpy.props.PointerProperty(
+        name="Look Ahead Target",
+        description="Track follower used as the camera aim target",
+        type=bpy.types.Object,
+        poll=is_empty_object,
+        update=camera_settings_update,
+    )
+    mount_object: bpy.props.PointerProperty(
+        name="Mounted Car",
+        description="Train follower empty carrying this ride camera",
+        type=bpy.types.Object,
+        poll=is_camera_mount_object,
+        update=camera_settings_update,
+    )
+    offset_xyz: bpy.props.FloatVectorProperty(
+        name="Camera Offset",
+        description="Seat-relative camera offset in the mounted follower's local XYZ axes",
+        subtype="TRANSLATION",
+        size=3,
+        default=(0.0, 0.0, 1.6),
+        update=camera_settings_update,
+    )
+    look_ahead_meters: bpy.props.FloatProperty(
+        name="Look Ahead",
+        description="Route distance ahead of the mounted car maintained by the camera target follower",
+        min=0.1,
+        subtype="DISTANCE",
+        default=5.0,
+        update=camera_settings_update,
+    )
+    target_vertical_offset_meters: bpy.props.FloatProperty(
+        name="Target Height",
+        description="Local height of the look-ahead follower so the camera aims horizontally at equal offsets",
+        subtype="DISTANCE",
+        default=1.6,
+        update=camera_settings_update,
+    )
+    shake_enabled: bpy.props.BoolProperty(
+        name="Camera Shake",
+        description="Add deterministic camera movement driven by speed and lateral and vertical track load",
+        default=False,
+        update=camera_settings_update,
+    )
+    shake_factor: bpy.props.FloatProperty(
+        name="Shake Factor",
+        description="Multiplier for speed- and G-driven camera shake",
+        min=0.0,
+        max=10.0,
+        soft_max=3.0,
+        default=1.0,
+        update=camera_settings_update,
+    )
 
 
 class CoasterMixerTrackSettings(bpy.types.PropertyGroup):
@@ -793,4 +912,3 @@ class CoasterMixerSceneSettings(bpy.types.PropertyGroup):
         poll=is_curve_object,
         update=track_object_update,
     )
-
