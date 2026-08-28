@@ -13,7 +13,24 @@ bl_info = {
 
 """Coaster Mixer add-on package and Blender registration entry point."""
 
-from . import runtime
+import importlib
+import sys
+
+
+_MODULE_NAMES = ("runtime", "model", "operators", "ui")
+_NEEDS_RELOAD = any(f"{__name__}.{module_name}" in sys.modules for module_name in _MODULE_NAMES)
+
+from . import model, operators, runtime, ui
+
+if _NEEDS_RELOAD:
+    # Blender keeps package submodules alive when Reload Scripts or a disable /
+    # enable cycle reloads only this entry point. Reload from the lowest layer
+    # upward so registration never mixes class definitions from two versions.
+    runtime = importlib.reload(runtime)
+    model = importlib.reload(model)
+    operators = importlib.reload(operators)
+    ui = importlib.reload(ui)
+
 from .ui import *
 
 # Blender invokes these runtime callbacks after every module has loaded. Keep
