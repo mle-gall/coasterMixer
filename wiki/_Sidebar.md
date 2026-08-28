@@ -1,9 +1,9 @@
 **Coaster Mixer**
 
-- [Home](Home.md)
-- [Feature Rundown](Feature-Rundown.md)
-- [Usage Guide](Usage-Guide.md)
-- [Troubleshooting and Limitations](Troubleshooting-and-Limitations.md)
+- [Home](Home)
+- [Feature Rundown](Feature-Rundown)
+- [Usage Guide](Usage-Guide)
+- [Troubleshooting and Limitations](Troubleshooting-and-Limitations)
 
 ---
 

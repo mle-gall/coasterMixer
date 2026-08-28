@@ -4,9 +4,9 @@ Coaster Mixer is a Blender 5.x add-on for turning Blender curves into a connecte
 
 ## Start here
 
-- **[Usage Guide](Usage-Guide.md)** — install the add-on and build a working coaster from a curve.
-- **[Feature Rundown](Feature-Rundown.md)** — understand track pieces, switches, actuators, blocks, sensors, train followers, cameras, and simulation.
-- **[Troubleshooting and Limitations](Troubleshooting-and-Limitations.md)** — diagnose common setup problems and review current constraints.
+- **[Usage Guide](Usage-Guide)** — install the add-on and build a working coaster from a curve.
+- **[Feature Rundown](Feature-Rundown)** — understand track pieces, switches, actuators, blocks, sensors, train followers, cameras, and simulation.
+- **[Troubleshooting and Limitations](Troubleshooting-and-Limitations)** — diagnose common setup problems and review current constraints.
 
 ## The basic workflow
 
