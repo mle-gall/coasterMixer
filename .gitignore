@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.blend1
+*.blend2
+*.blend@
+.DS_Store
+.idea/
+.vscode/
+.claude/
+dist/

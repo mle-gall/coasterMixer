@@ -1,0 +1,38 @@
+name: Build Blender add-on
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build extension package
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check Python syntax
+        run: python -m compileall -q coaster_mixer bench_sim.py scripts/build_addon.py
+
+      - name: Build Blender Extension
+        run: python scripts/build_addon.py
+
+      - name: Upload extension package
+        uses: actions/upload-artifact@v4
+        with:
+          name: coaster-mixer-${{ github.sha }}
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 30
