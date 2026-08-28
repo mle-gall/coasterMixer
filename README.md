@@ -8,6 +8,15 @@ arc-length-accurate train followers in the 3D View sidebar.
 > **Project status:** early prototype. The file format and Python API may change.
 > Coaster Mixer currently targets Blender 5.0 and newer.
 
+## Full coaster setup walkthrough
+
+Watch the complete setup video to see a coaster curve configured with track
+hardware, blocks, train followers, and simulation:
+
+[![Watch the full Coaster Mixer setup walkthrough](https://img.youtube.com/vi/QcXsMtAH3MY/hqdefault.jpg)](https://www.youtube.com/watch?v=QcXsMtAH3MY)
+
+[Watch the full coaster setup walkthrough on YouTube](https://www.youtube.com/watch?v=QcXsMtAH3MY)
+
 ## Features
 
 - Build a track as a graph of Blender curve objects, including switches and
