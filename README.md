@@ -46,14 +46,13 @@ The add-on appears under **3D View → Sidebar → Coaster**.
 
 ## Documentation
 
-The project wiki source is kept in [`wiki/`](wiki/Home.md):
+Read the [Coaster Mixer Wiki](https://github.com/mle-gall/coasterMixer/wiki):
 
-- [Feature rundown](wiki/Feature-Rundown.md)
-- [Usage guide](wiki/Usage-Guide.md)
-- [Troubleshooting and limitations](wiki/Troubleshooting-and-Limitations.md)
+- [Feature rundown](https://github.com/mle-gall/coasterMixer/wiki/Feature-Rundown)
+- [Usage guide](https://github.com/mle-gall/coasterMixer/wiki/Usage-Guide)
+- [Troubleshooting and limitations](https://github.com/mle-gall/coasterMixer/wiki/Troubleshooting-and-Limitations)
 
-These pages are formatted for GitHub Wiki and can also be read directly in
-the repository.
+The Markdown source is also kept in [`wiki/`](wiki/Home.md) alongside the code.
 
 ## Quick start
 
