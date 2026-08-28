@@ -105,6 +105,11 @@ ORIENTATION_FRAME_ITEMS = [
         "Orient each sample against world Z; compatible with existing tracks but singular at vertical tangents",
     ),
     (
+        "CONTINUOUS_Z_UP",
+        "Continuous Z Up (Vertical Safe)",
+        "Match Z-up orientation away from vertical and carry a continuous up direction through vertical tangents",
+    ),
+    (
         "MINIMUM_TWIST",
         "Minimum Twist (Vertical Safe)",
         "Parallel-transport orientation along the curve without flipping when the track becomes vertical",
@@ -449,6 +454,44 @@ def build_minimum_twist_frames(point_tangents, distances, cyclic=False):
     return frames
 
 
+def build_continuous_z_up_frames(point_tangents):
+    """Build Z-up frames while keeping the normal branch continuous at verticals.
+
+    Projecting world Z onto the tangent plane produces the familiar Z-up
+    orientation, but the projection vanishes at a vertical tangent and changes
+    sign across it. Carrying the preceding up vector through that small region
+    and choosing the closest sign afterward removes the 180-degree flip without
+    allowing minimum-twist roll to accumulate over the rest of the layout.
+    """
+    if not point_tangents:
+        return []
+
+    world_up = Vector((0.0, 0.0, 1.0))
+    frames = []
+    previous_tangent = None
+    previous_up = None
+    for tangent_value in point_tangents:
+        tangent = tangent_value.normalized()
+        z_up = world_up - tangent * world_up.dot(tangent)
+        if z_up.length > 1.0e-5:
+            z_up.normalize()
+            if previous_up is not None and z_up.dot(previous_up) < 0.0:
+                z_up.negate()
+            up_hint = z_up
+        elif previous_up is not None:
+            transport = previous_tangent.rotation_difference(tangent)
+            up_hint = transport @ previous_up
+        else:
+            up_hint = Vector((1.0, 0.0, 0.0))
+
+        frame = frame_from_tangent_and_up(tangent, up_hint)
+        frames.append(frame)
+        previous_tangent = tangent
+        previous_up = frame @ Vector((0.0, 0.0, 1.0))
+
+    return frames
+
+
 def build_curve_cache_data(track_object):
     global CURVE_CACHE_REVISION_COUNTER
 
@@ -478,12 +521,15 @@ def build_curve_cache_data(track_object):
 
     point_tangents = build_point_tangents(points, segment_directions)
     point_frames = []
-    if track_object.coaster_mixer_track.orientation_frame_mode == "MINIMUM_TWIST":
+    orientation_frame_mode = track_object.coaster_mixer_track.orientation_frame_mode
+    if orientation_frame_mode == "MINIMUM_TWIST":
         point_frames = build_minimum_twist_frames(
             point_tangents,
             distances,
             cyclic=(len(points) > 1 and (points[0] - points[-1]).length <= 1.0e-6),
         )
+    elif orientation_frame_mode == "CONTINUOUS_Z_UP":
+        point_frames = build_continuous_z_up_frames(point_tangents)
 
     CURVE_CACHE_REVISION_COUNTER += 1
     return {

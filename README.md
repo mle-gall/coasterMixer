@@ -25,8 +25,8 @@ hardware, blocks, train followers, and simulation:
 - Sequence block behavior with a node-based control graph.
 - Trigger named animation channels from sensors and block programs.
 - Place train followers and cameras at accurate arc-length offsets.
-- Carry follower orientation through vertical elements with an optional
-  minimum-twist frame that avoids Z-up singularities.
+- Carry follower orientation through vertical elements with continuous Z-up
+  and minimum-twist frame options that avoid orientation singularities.
 - Mount ride cameras on any train car, align them to a seat with XYZ offsets,
   and add deterministic speed- and G-driven camera shake.
 - Preview deterministic physics from the Blender timeline and bake the same

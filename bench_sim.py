@@ -347,6 +347,20 @@ def check_vertical_safe_frames(addon):
             assert previous_up.dot(up) > 0.98, "minimum-twist frame flipped near vertical"
         previous_up = up
 
+    continuous_frames = addon.build_continuous_z_up_frames(tangents)
+    previous_up = None
+    for index, (tangent, frame) in enumerate(zip(tangents, continuous_frames)):
+        forward = frame @ Vector((0.0, 1.0, 0.0))
+        up = frame @ Vector((0.0, 0.0, 1.0))
+        assert forward.dot(tangent) > 0.99999, "continuous Z-up frame lost the track tangent"
+        if previous_up is not None:
+            assert previous_up.dot(up) > 0.98, "continuous Z-up frame flipped near vertical"
+        if index == 0:
+            assert up.z > 0.99999, "continuous Z-up frame should begin upright"
+        if index == sample_count - 1:
+            assert up.z < -0.99999, "half-loop frame should finish inverted without a snap"
+        previous_up = up
+
 
 def run_live_loop(addon, scene_settings, per_frame_invalidation):
     """Time a frame_set loop with an explicit invalidation policy.
