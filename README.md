@@ -5,8 +5,7 @@ curve objects. It provides a curve-segment editor, connected track routes,
 switches, transport and brake zones, block sequencing, sensors, and
 arc-length-accurate train followers in the 3D View sidebar.
 
-> **Project status:** early prototype. The file format and Python API may change.
-> Coaster Mixer currently targets Blender 5.0 and newer.
+Coaster Mixer currently targets Blender 5.0 and newer.
 
 ## Full coaster setup walkthrough
 
@@ -44,6 +43,17 @@ Blender's `scripts/addons` directory, refresh the add-on list, and enable
 **Coaster Mixer**.
 
 The add-on appears under **3D View → Sidebar → Coaster**.
+
+## Documentation
+
+The project wiki source is kept in [`wiki/`](wiki/Home.md):
+
+- [Feature rundown](wiki/Feature-Rundown.md)
+- [Usage guide](wiki/Usage-Guide.md)
+- [Troubleshooting and limitations](wiki/Troubleshooting-and-Limitations.md)
+
+These pages are formatted for GitHub Wiki and can also be read directly in
+the repository.
 
 ## Quick start
 
