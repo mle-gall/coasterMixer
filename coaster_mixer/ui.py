@@ -491,12 +491,13 @@ class COASTERMIXER_PT_piece(CoasterMixerPanelMixin, bpy.types.Panel):
             banking_box.label(text="Vertical-safe: tilt is applied as physical banking.", icon="INFO")
         banking_box.prop(piece_settings, "bank_seam_mode")
         if piece_settings.bank_seam_mode == "MANUAL":
-            banking_box.prop(piece_settings, "bank_seam_turns")
+            banking_box.prop(piece_settings, "bank_seam_half_turns")
         if spline.use_cyclic_u:
             if piece_settings.bank_seam_mode == "AUTO":
-                banking_box.label(text="Equivalent seam angles are joined without an extra roll.", icon="INFO")
+                banking_box.label(text="Matching 180°/360° winding is preserved automatically.", icon="INFO")
             elif piece_settings.bank_seam_mode == "MANUAL":
-                banking_box.label(text=f"Seam closes at start tilt + {piece_settings.bank_seam_turns * 360}°.", icon="INFO")
+                seam_degrees = piece_settings.bank_seam_half_turns * 180.0
+                banking_box.label(text=f"Seam closes at start tilt + {seam_degrees:g}°.", icon="INFO")
 
         layout.label(text="Actuators", icon="MODIFIER")
         row = layout.row()

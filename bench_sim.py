@@ -23,7 +23,7 @@ import json
 import re
 import sys
 import time
-from math import cos, pi, sin
+from math import cos, pi, sin, tau
 from pathlib import Path
 
 import bpy
@@ -328,6 +328,13 @@ def check_camera_rig(addon, track_object, scene_settings):
 
 def check_vertical_safe_frames(addon):
     """Minimum-twist frames must remain continuous through a vertical tangent."""
+    half_turn_seam = addon.unwrap_tilt_values([0.0, pi], cyclic=True)
+    assert abs(half_turn_seam[-1] - pi) <= 1.0e-9, "automatic seam discarded a matching half turn"
+    full_turn_seam = addon.unwrap_tilt_values([0.0, tau], cyclic=True)
+    assert abs(full_turn_seam[-1] - tau) <= 1.0e-9, "automatic seam discarded a matching full turn"
+    ordinary_seam = addon.unwrap_tilt_values([0.0, pi * 0.25], cyclic=True)
+    assert abs(ordinary_seam[-1]) <= 1.0e-9, "automatic seam failed to unwind an ordinary tilt"
+
     sample_count = 33
     tangents = []
     distances = []

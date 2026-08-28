@@ -760,11 +760,11 @@ class CoasterMixerTrackSettings(bpy.types.PropertyGroup):
         default="AUTO",
         update=track_settings_update,
     )
-    bank_seam_turns: bpy.props.IntProperty(
-        name="Seam Turns",
-        description="Manual accumulated bank winding at the cyclic seam; 1 means the end is equivalent to start plus 360 degrees",
-        min=-100,
-        max=100,
+    bank_seam_half_turns: bpy.props.IntProperty(
+        name="Seam Half Turns",
+        description="Manual bank winding at the cyclic seam; 1 adds 180 degrees and 2 adds 360 degrees",
+        min=-200,
+        max=200,
         default=0,
         update=track_settings_update,
     )

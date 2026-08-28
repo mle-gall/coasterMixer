@@ -279,7 +279,7 @@ def get_curve_cache_signature(track_object):
         bool(spline.use_cyclic_u),
         int(getattr(spline, "resolution_u", 0)),
         track_settings.bank_seam_mode,
-        track_settings.bank_seam_turns,
+        track_settings.bank_seam_half_turns,
         track_settings.orientation_frame_mode,
         point_key,
     )
@@ -288,8 +288,9 @@ def get_curve_cache_signature(track_object):
 def unwrap_tilt_values(values, cyclic=False, seam_mode="AUTO", seam_turns=0):
     """Build tilt values, optionally choosing a cyclic seam endpoint.
 
-    Blender permits a cyclic spline to begin at 0 and end at 2*pi. Those
-    angles are the same orientation. Automatic mode changes only the
+    Blender permits cyclic spline endpoints to use accumulated winding,
+    including half turns when the chosen base frame returns inverted.
+    Automatic mode changes only the
     generated closing endpoint; interior values stay exactly as authored so
     follower banking agrees with Blender, including intentional inversions.
     """
@@ -305,8 +306,13 @@ def unwrap_tilt_values(values, cyclic=False, seam_mode="AUTO", seam_turns=0):
             authored.append(authored[0] + seam_turns * tau)
         else:
             previous = authored[-1]
-            closing_delta = (authored[0] - previous + pi) % tau - pi
-            authored.append(previous + closing_delta)
+            half_turns = round((previous - authored[0]) / pi)
+            matching_half_turn = authored[0] + half_turns * pi
+            if abs(previous - matching_half_turn) <= 1.0e-4:
+                authored.append(matching_half_turn)
+            else:
+                closing_delta = (authored[0] - previous + pi) % tau - pi
+                authored.append(previous + closing_delta)
     return authored
 
 
@@ -335,7 +341,7 @@ def build_curve_world_points(track_object):
             [point.tilt for point in bezier_points],
             cyclic=spline.use_cyclic_u,
             seam_mode=track_settings.bank_seam_mode,
-            seam_turns=track_settings.bank_seam_turns,
+            seam_turns=track_settings.bank_seam_half_turns * 0.5,
         )
 
         for index in range(segment_count):
@@ -363,7 +369,7 @@ def build_curve_world_points(track_object):
         [point.tilt for point in spline.points],
         cyclic=spline.use_cyclic_u,
         seam_mode=track_settings.bank_seam_mode,
-        seam_turns=track_settings.bank_seam_turns,
+        seam_turns=track_settings.bank_seam_half_turns * 0.5,
     )
     for index, point in enumerate(spline.points):
         world_points.append(matrix_world @ Vector(point.co[:3]))
