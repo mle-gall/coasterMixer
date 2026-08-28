@@ -23,6 +23,7 @@ import json
 import re
 import sys
 import time
+from math import cos, pi, sin
 from pathlib import Path
 
 import bpy
@@ -325,6 +326,28 @@ def check_camera_rig(addon, track_object, scene_settings):
     )
 
 
+def check_vertical_safe_frames(addon):
+    """Minimum-twist frames must remain continuous through a vertical tangent."""
+    sample_count = 33
+    tangents = []
+    distances = []
+    for index in range(sample_count):
+        angle = pi * index / (sample_count - 1)
+        tangents.append(Vector((0.0, cos(angle), sin(angle))))
+        distances.append(float(index))
+
+    frames = addon.build_minimum_twist_frames(tangents, distances)
+    assert len(frames) == sample_count
+    previous_up = None
+    for tangent, frame in zip(tangents, frames):
+        forward = frame @ Vector((0.0, 1.0, 0.0))
+        up = frame @ Vector((0.0, 0.0, 1.0))
+        assert forward.dot(tangent) > 0.99999, "minimum-twist frame lost the track tangent"
+        if previous_up is not None:
+            assert previous_up.dot(up) > 0.98, "minimum-twist frame flipped near vertical"
+        previous_up = up
+
+
 def run_live_loop(addon, scene_settings, per_frame_invalidation):
     """Time a frame_set loop with an explicit invalidation policy.
 
@@ -573,6 +596,7 @@ def main():
     results = {"label": label}
     check_ui_statics(addon)
     check_camera_rig(addon, track_object, scene_settings)
+    check_vertical_safe_frames(addon)
     results.update(bench_live_playback(addon, scene_settings))
     results.update(check_scrub_and_loop(addon, scene_settings, track_object))
     bake_stats, values = bench_bake(addon, track_object)

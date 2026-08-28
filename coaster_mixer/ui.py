@@ -484,6 +484,9 @@ class COASTERMIXER_PT_piece(CoasterMixerPanelMixin, bpy.types.Panel):
 
         banking_box = layout.box()
         banking_box.label(text="Curve Banking", icon="DRIVER_ROTATIONAL_DIFFERENCE")
+        banking_box.prop(piece_settings, "orientation_frame_mode")
+        if piece_settings.orientation_frame_mode == "MINIMUM_TWIST":
+            banking_box.label(text="Vertical-safe: tilt is applied as physical banking.", icon="INFO")
         banking_box.prop(piece_settings, "bank_seam_mode")
         if piece_settings.bank_seam_mode == "MANUAL":
             banking_box.prop(piece_settings, "bank_seam_turns")

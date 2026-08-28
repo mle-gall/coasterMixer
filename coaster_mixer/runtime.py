@@ -4,7 +4,7 @@
 import bpy
 import gpu
 from bisect import bisect_left, bisect_right
-from math import log1p, pi, sin, tau
+from math import atan2, log1p, pi, sin, tau
 from time import perf_counter
 from mathutils import Matrix, Quaternion, Vector
 from mathutils.geometry import interpolate_bezier
@@ -97,6 +97,18 @@ BANK_SEAM_MODE_ITEMS = [
     ("AUTO", "Automatic Seam", "Preserve authored point tilts and choose the equivalent start angle that makes only the cyclic closing seam shortest"),
     ("AUTHORED", "Exact Authored Values", "Interpolate the raw Blender tilt values exactly, including any roll across the cyclic seam"),
     ("MANUAL", "Manual Seam Winding", "Keep interior banking continuous and explicitly choose the accumulated full turns at the cyclic seam"),
+]
+ORIENTATION_FRAME_ITEMS = [
+    (
+        "Z_UP",
+        "Z Up (Legacy)",
+        "Orient each sample against world Z; compatible with existing tracks but singular at vertical tangents",
+    ),
+    (
+        "MINIMUM_TWIST",
+        "Minimum Twist (Vertical Safe)",
+        "Parallel-transport orientation along the curve without flipping when the track becomes vertical",
+    ),
 ]
 CONTROL_RESPONSE_CURVE_ITEMS = [
     ("LINEAR", "Linear", "Apply a constant acceleration or deceleration limit toward the target speed"),
@@ -226,6 +238,7 @@ def get_empty_curve_cache():
         "horizontal_distances": [],
         "segment_directions": [],
         "point_tangents": [],
+        "point_frames": [],
         "tilts": [],
         "total_length": 0.0,
         "revision": 0,
@@ -262,6 +275,7 @@ def get_curve_cache_signature(track_object):
         int(getattr(spline, "resolution_u", 0)),
         track_settings.bank_seam_mode,
         track_settings.bank_seam_turns,
+        track_settings.orientation_frame_mode,
         point_key,
     )
 
@@ -385,6 +399,56 @@ def build_point_tangents(points, segment_directions):
     return point_tangents
 
 
+def frame_from_tangent_and_up(tangent, up_hint):
+    """Build a local +Y-forward, +Z-up frame from orthogonal world vectors."""
+    forward = tangent.normalized()
+    up = up_hint - forward * up_hint.dot(forward)
+    if up.length <= 1.0e-8:
+        fallback = Vector((1.0, 0.0, 0.0))
+        if abs(forward.dot(fallback)) > 0.95:
+            fallback = Vector((0.0, 1.0, 0.0))
+        up = fallback - forward * fallback.dot(forward)
+    up.normalize()
+    right = forward.cross(up).normalized()
+    up = right.cross(forward).normalized()
+    return Matrix((right, forward, up)).transposed().to_quaternion()
+
+
+def build_minimum_twist_frames(point_tangents, distances, cyclic=False):
+    """Build rotation-minimizing frames by parallel-transporting the up axis."""
+    if not point_tangents:
+        return []
+
+    first_tangent = point_tangents[0].normalized()
+    first_frame = frame_from_tangent_and_up(first_tangent, Vector((0.0, 0.0, 1.0)))
+    frames = [first_frame]
+    previous_tangent = first_tangent
+    previous_up = first_frame @ Vector((0.0, 0.0, 1.0))
+
+    for tangent_value in point_tangents[1:]:
+        tangent = tangent_value.normalized()
+        transport = previous_tangent.rotation_difference(tangent)
+        transported_up = transport @ previous_up
+        frame = frame_from_tangent_and_up(tangent, transported_up)
+        frames.append(frame)
+        previous_tangent = tangent
+        previous_up = frame @ Vector((0.0, 0.0, 1.0))
+
+    if cyclic and len(frames) > 1 and distances and distances[-1] > 1.0e-8:
+        tangent = point_tangents[0].normalized()
+        first_up = frames[0] @ Vector((0.0, 0.0, 1.0))
+        last_up = frames[-1] @ Vector((0.0, 0.0, 1.0))
+        closure_angle = atan2(tangent.dot(last_up.cross(first_up)), last_up.dot(first_up))
+        if abs(closure_angle) > 1.0e-9:
+            total_length = distances[-1]
+            frames = [
+                frame @ Quaternion((0.0, 1.0, 0.0), closure_angle * distance / total_length)
+                for frame, distance in zip(frames, distances)
+            ]
+
+    return frames
+
+
 def build_curve_cache_data(track_object):
     global CURVE_CACHE_REVISION_COUNTER
 
@@ -412,13 +476,23 @@ def build_curve_cache_data(track_object):
         horizontal_step = (segment_vector.x * segment_vector.x + segment_vector.y * segment_vector.y) ** 0.5
         horizontal_distances.append(horizontal_distances[-1] + horizontal_step)
 
+    point_tangents = build_point_tangents(points, segment_directions)
+    point_frames = []
+    if track_object.coaster_mixer_track.orientation_frame_mode == "MINIMUM_TWIST":
+        point_frames = build_minimum_twist_frames(
+            point_tangents,
+            distances,
+            cyclic=(len(points) > 1 and (points[0] - points[-1]).length <= 1.0e-6),
+        )
+
     CURVE_CACHE_REVISION_COUNTER += 1
     return {
         "points": points,
         "distances": distances,
         "horizontal_distances": horizontal_distances,
         "segment_directions": segment_directions,
-        "point_tangents": build_point_tangents(points, segment_directions),
+        "point_tangents": point_tangents,
+        "point_frames": point_frames,
         "tilts": tilts,
         "total_length": distances[-1] if distances else 0.0,
         "revision": CURVE_CACHE_REVISION_COUNTER,
@@ -487,6 +561,7 @@ def sample_curve_placement(cache, distance, reverse=False):
     points = cache["points"]
     distances = cache["distances"]
     point_tangents = cache["point_tangents"]
+    point_frames = cache.get("point_frames", [])
     tilts = cache["tilts"]
     total_length = cache["total_length"]
 
@@ -515,12 +590,18 @@ def sample_curve_placement(cache, distance, reverse=False):
 
     tilt = tilts[index - 1] + (tilts[index] - tilts[index - 1]) * factor
 
-    if reverse:
-        tangent = tangent * -1.0
-        tilt = -tilt
-
-    # Local +Y rides forward along the track, +Z up, then roll by curve tilt.
-    rotation = tangent.to_track_quat("Y", "Z")
+    if point_frames:
+        rotation = point_frames[index - 1].slerp(point_frames[index], factor)
+        if reverse:
+            # Preserve physical up while local +Y changes travel direction.
+            rotation = rotation @ Quaternion((0.0, 0.0, 1.0), pi)
+            tilt = -tilt
+    else:
+        if reverse:
+            tangent = tangent * -1.0
+            tilt = -tilt
+        # Legacy mode: world-Z reference is singular when tangent is vertical.
+        rotation = tangent.to_track_quat("Y", "Z")
     if abs(tilt) > 1.0e-9:
         rotation = rotation @ Quaternion((0.0, 1.0, 0.0), tilt)
 

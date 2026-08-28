@@ -746,6 +746,13 @@ class CoasterMixerTrackSettings(bpy.types.PropertyGroup):
     zones: bpy.props.CollectionProperty(type=CoasterMixerZone)
     sensors: bpy.props.CollectionProperty(type=CoasterMixerSensor)
     block_groups: bpy.props.CollectionProperty(type=CoasterMixerBlockGroup)
+    orientation_frame_mode: bpy.props.EnumProperty(
+        name="Orientation Frame",
+        description="How follower up orientation is carried along this curve piece",
+        items=ORIENTATION_FRAME_ITEMS,
+        default="Z_UP",
+        update=track_settings_update,
+    )
     bank_seam_mode: bpy.props.EnumProperty(
         name="Bank Continuity",
         description="How equivalent curve tilt angles are interpreted while sampling this piece",
