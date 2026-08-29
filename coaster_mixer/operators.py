@@ -797,6 +797,93 @@ class COASTERMIXER_OT_attach_selected_followers(bpy.types.Operator):
         return {"FINISHED"}
 
 
+def get_adjustable_seam_station(track_object):
+    """Return the default seam station and its route-backed member zones.
+
+    Resizing is intentionally limited to a Station whose hardware ends at the
+    cyclic route seam and lives on the final route piece. That lets us preserve
+    the station exit exactly while moving only its upstream edge.
+    """
+    route = get_resolved_route(track_object)
+    if not route["cyclic"] or not route["entries"]:
+        return None
+
+    derived = get_route_derived_data(route)
+    programs_by_key = {program["key"]: program for program in derived["programs"]}
+    zones_by_key = {
+        (item["entry"]["object"].as_pointer(), item["zone_index"]): item
+        for item in derived["zones"]
+    }
+    route_end = route["total_length"]
+    final_entry = route["entries"][-1]
+    root_settings = track_object.coaster_mixer_track
+
+    for block in root_settings.block_groups:
+        if block.name.strip().lower() != "station":
+            continue
+        program = programs_by_key.get(f"block:{block.as_pointer()}")
+        if program is None or abs(program["span"][1] - route_end) > 1.0e-3:
+            continue
+        member_items = []
+        for member in block.members:
+            if member.piece is None:
+                continue
+            item = zones_by_key.get((member.piece.as_pointer(), member.zone_index))
+            if item is not None:
+                member_items.append(item)
+        if not member_items or any(
+            item["entry"]["object"] != final_entry["object"]
+            or item["entry"]["reversed"] != final_entry["reversed"]
+            or abs(item["route_end"] - route_end) > 1.0e-3
+            for item in member_items
+        ):
+            continue
+        return {
+            "route": route,
+            "block": block,
+            "member_items": member_items,
+            "current_length": max(route_end - program["span"][0], 0.0),
+            "maximum_length": final_entry["length"],
+        }
+    return None
+
+
+def resize_seam_station(station, requested_length):
+    """Resize a seam station upstream, leaving its route-space exit fixed."""
+    route = station["route"]
+    block = station["block"]
+    old_length = station["current_length"]
+    new_length = clamp(requested_length, 0.0, station["maximum_length"])
+    route_end = route["total_length"]
+    route_start = route_end - new_length
+
+    for item in station["member_items"]:
+        entry = item["entry"]
+        local_a = route_to_piece_distance(entry, route_start)
+        local_b = route_to_piece_distance(entry, route_end)
+        zone = item["zone"]
+        zone.start_meters = min(local_a, local_b)
+        zone.length_meters = abs(local_b - local_a)
+        sync_zone_to_curve(entry["object"], zone)
+
+    # Signed seam coordinates make the anchoring explicit: the exit remains
+    # zero and only the entry moves backward as the station grows.
+    block.start_route_meters = -new_length
+    block.end_route_meters = 0.0
+
+    # The generated Station graph places its hold and dispatch gates at the
+    # old downstream edge. Keep those edge-bound gates at the new edge while
+    # leaving deliberately authored intermediate positions untouched.
+    tree = block.control_tree
+    if tree is not None:
+        for node in tree.nodes:
+            if hasattr(node, "offset_meters") and abs(node.offset_meters - old_length) <= 1.0e-3:
+                node.offset_meters = new_length
+
+    block_group_update(route["entries"][0]["settings"], bpy.context)
+    return new_length
+
+
 class COASTERMIXER_OT_create_train_followers(bpy.types.Operator):
     bl_idname = "coaster_mixer.create_train_followers"
     bl_label = "Create Car Empties"
@@ -817,12 +904,29 @@ class COASTERMIXER_OT_create_train_followers(bpy.types.Operator):
         subtype="DISTANCE",
         default=2.4,
     )
+    car_length_meters: bpy.props.FloatProperty(
+        name="Car Length",
+        description="Physical length of each car, used to calculate the proposed full train length",
+        min=0.01,
+        subtype="DISTANCE",
+        default=2.4,
+    )
     start_offset_meters: bpy.props.FloatProperty(
         name="Start Offset",
         description="Arc-length distance from the train front to the first follower",
         min=0.0,
         subtype="DISTANCE",
         default=0.0,
+    )
+    adjust_train_length: bpy.props.BoolProperty(
+        name="Set Train Length",
+        description="Set the physical train length to Car Count multiplied by Car Length",
+        default=True,
+    )
+    adjust_station_length: bpy.props.BoolProperty(
+        name="Resize Station to Train",
+        description="Match the seam Station to the calculated train length by moving its entry backward while keeping its exit at the coaster start",
+        default=True,
     )
 
     @classmethod
@@ -831,10 +935,39 @@ class COASTERMIXER_OT_create_train_followers(bpy.types.Operator):
         return track_object is not None
 
     def invoke(self, context, _event):
-        return context.window_manager.invoke_props_dialog(self)
+        return context.window_manager.invoke_props_dialog(self, width=420)
+
+    def draw(self, context):
+        layout = self.layout
+        column = layout.column()
+        column.use_property_split = True
+        column.use_property_decorate = False
+        column.prop(self, "car_count")
+        column.prop(self, "car_length_meters")
+        column.prop(self, "car_spacing_meters")
+        column.prop(self, "start_offset_meters")
+
+        proposed_length = self.car_count * self.car_length_meters
+        proposal = layout.box()
+        proposal.label(text=f"Calculated train length: {proposed_length:.2f} m", icon="DRIVER_DISTANCE")
+        proposal.prop(self, "adjust_train_length")
+
+        track_object, _track_settings = resolve_active_track_settings(context)
+        station = get_adjustable_seam_station(track_object) if track_object is not None else None
+        station_column = proposal.column()
+        station_column.enabled = station is not None
+        station_column.prop(self, "adjust_station_length")
+        if station is not None:
+            station_length = min(proposed_length, station["maximum_length"])
+            station_column.label(text=f"Station: {station['current_length']:.2f} m → {station_length:.2f} m")
+            station_column.label(text="Exit stays at coaster start; entry moves backward.", icon="INFO")
+            if proposed_length > station["maximum_length"] + 1.0e-3:
+                station_column.label(text="Limited by the final track piece length.", icon="ERROR")
+        else:
+            proposal.label(text="No adjustable Station ending at the coaster start.", icon="INFO")
 
     def execute(self, context):
-        track_object, _track_settings = resolve_active_track_settings(context)
+        track_object, track_settings = resolve_active_track_settings(context)
         if track_object is None:
             self.report({"WARNING"}, "Select a curve object first")
             return {"CANCELLED"}
@@ -847,9 +980,21 @@ class COASTERMIXER_OT_create_train_followers(bpy.types.Operator):
             context.collection.objects.link(empty_object)
             ensure_follower_drivers(track_object, empty_object, offset_meters=offset_meters)
 
+        proposed_length = self.car_count * self.car_length_meters
+        if self.adjust_train_length:
+            track_settings.train_length_meters = proposed_length
+
+        station_message = ""
+        if self.adjust_station_length:
+            station = get_adjustable_seam_station(track_object)
+            if station is not None:
+                station_length = resize_seam_station(station, proposed_length)
+                station_message = f"; Station resized backward to {station_length:.2f} m"
+
         tag_track_placement_update(track_object)
         tag_redraw_view3d()
-        self.report({"INFO"}, f"Created {self.car_count} follower empties")
+        train_message = f"; train length set to {proposed_length:.2f} m" if self.adjust_train_length else ""
+        self.report({"INFO"}, f"Created {self.car_count} follower empties{train_message}{station_message}")
         return {"FINISHED"}
 
 
@@ -1177,7 +1322,7 @@ def seed_default_station(context, track_object):
         member = block.members.add()
         member.piece = track_object
         member.zone_index = zone_index
-    block.control_tree = create_default_control_tree("Station")
+    block.control_tree = create_default_control_tree("Station", move_offset=station_length)
     block.control_template = "LOAD_STATION"
     settings.active_zone_index = 1
     settings.active_block_group_index = 0
