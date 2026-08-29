@@ -1855,8 +1855,6 @@ def draw_viewport_overlay():
     draw_points(draw_data["seam_points"], SEAM_MARKER_COLOR, 10.0)
     draw_points(draw_data["sensor_points"], SENSOR_MARKER_COLOR, 12.0)
     gpu.state.blend_set("NONE")
-
-
 def ensure_viewport_draw_handler():
     global VIEWPORT_DRAW_HANDLER
     if VIEWPORT_DRAW_HANDLER is not None:
@@ -1872,11 +1870,9 @@ def ensure_viewport_draw_handler():
 
 def remove_viewport_draw_handler():
     global VIEWPORT_DRAW_HANDLER
-    if VIEWPORT_DRAW_HANDLER is None:
-        return
-
-    bpy.types.SpaceView3D.draw_handler_remove(VIEWPORT_DRAW_HANDLER, "WINDOW")
-    VIEWPORT_DRAW_HANDLER = None
+    if VIEWPORT_DRAW_HANDLER is not None:
+        bpy.types.SpaceView3D.draw_handler_remove(VIEWPORT_DRAW_HANDLER, "WINDOW")
+        VIEWPORT_DRAW_HANDLER = None
 
 
 def resolve_active_track_object(context):
@@ -2264,6 +2260,55 @@ def get_camera_shake_offset(track_object, camera_object, mount_rotation, route, 
             amplitude * (0.7 * sin(phase * 23.9 + 1.4) + 0.3 * sin(phase * 52.7)),
         )
     )
+
+
+def get_simulation_overlay_metrics(scene, track_object, track_settings, route, front_meters, speed_mps):
+    if route["total_length"] <= 1.0e-8:
+        return None
+
+    wrapped_front = wrap_route_distance(route, front_meters)
+    _location, rotation = sample_route_placement(route, wrapped_front)
+    if rotation is None:
+        return None
+
+    curvature_acceleration = sample_route_curvature_vector(route, wrapped_front) * (speed_mps * speed_mps)
+    local_side = rotation @ Vector((1.0, 0.0, 0.0))
+    local_up = rotation @ Vector((0.0, 0.0, 1.0))
+    lateral_g_signed = curvature_acceleration.dot(local_side) / GRAVITY_ACCELERATION
+    apparent_acceleration = curvature_acceleration - Vector((0.0, 0.0, -GRAVITY_ACCELERATION))
+    vertical_g_signed = apparent_acceleration.dot(local_up) / GRAVITY_ACCELERATION
+    total_g = apparent_acceleration.length / GRAVITY_ACCELERATION
+
+    longitudinal_g_signed = 0.0
+    if scene is not None:
+        current_frame = int(getattr(scene, "frame_current", 0))
+        current_sample = sample_simulation_trajectory(scene, track_object, track_settings, current_frame)
+        previous_sample = sample_simulation_trajectory(scene, track_object, track_settings, current_frame - 1)
+        next_sample = sample_simulation_trajectory(scene, track_object, track_settings, current_frame + 1)
+        delta_seconds = 1.0 / max(get_scene_fps(scene), 1.0)
+        if current_sample is not None and previous_sample is not None and next_sample is not None:
+            longitudinal_g_signed = (
+                (next_sample[1] - previous_sample[1]) / (2.0 * delta_seconds)
+            ) / GRAVITY_ACCELERATION
+        elif current_sample is not None and previous_sample is not None:
+            longitudinal_g_signed = (
+                (current_sample[1] - previous_sample[1]) / delta_seconds
+            ) / GRAVITY_ACCELERATION
+        elif current_sample is not None and next_sample is not None:
+            longitudinal_g_signed = (
+                (next_sample[1] - current_sample[1]) / delta_seconds
+            ) / GRAVITY_ACCELERATION
+
+    return {
+        "front_meters": front_meters,
+        "wrapped_front_meters": wrapped_front,
+        "speed_mps": speed_mps,
+        "speed_kmh": speed_mps * 3.6,
+        "lateral_g_signed": lateral_g_signed,
+        "vertical_g_signed": vertical_g_signed,
+        "longitudinal_g_signed": longitudinal_g_signed,
+        "total_g": total_g,
+    }
 
 
 def place_ride_cameras(track_object, placement_by_object, route, front_meters):

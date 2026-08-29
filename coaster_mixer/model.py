@@ -860,6 +860,18 @@ class CoasterMixerTrackSettings(bpy.types.PropertyGroup):
 
 
 class CoasterMixerSceneSettings(bpy.types.PropertyGroup):
+    sidebar_section: bpy.props.EnumProperty(
+        name="Section",
+        description="Workflow section shown in the Coaster sidebar",
+        items=[
+            ("SETUP", "Track", "Root coaster, route, track piece, and utility tools", "TOOL_SETTINGS", 0),
+            ("TRAIN", "Train", "Train rig, followers, and ride camera setup", "CONSTRAINT_BONE", 1),
+            ("PIECE", "Hardware", "Track piece hardware, sensors, and switches", "MODIFIER", 2),
+            ("BLOCKS", "Blocks", "Occupancy blocks and ride control graphs", "NODETREE", 3),
+            ("SIMULATION", "Sim", "Playback, diagnostics, and bake controls", "PHYSICS", 4),
+        ],
+        default="SETUP",
+    )
     show_hardware_overlays: bpy.props.BoolProperty(
         name="Hardware",
         description="Show transport, friction-brake, trim-brake, and braking-influence overlays",

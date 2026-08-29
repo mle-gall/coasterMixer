@@ -96,6 +96,7 @@ CLASSES = (
     COASTERMIXER_OT_select_piece,
     COASTERMIXER_PT_coaster,
     COASTERMIXER_PT_route,
+    COASTERMIXER_PT_track_piece,
     COASTERMIXER_PT_piece,
     COASTERMIXER_PT_connections,
     COASTERMIXER_PT_train,

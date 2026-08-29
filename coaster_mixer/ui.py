@@ -5,6 +5,14 @@
 
 from .operators import *
 
+
+def is_sidebar_section_active(context, *section_ids):
+    scene_settings = getattr(context.scene, "coaster_mixer_scene", None)
+    if scene_settings is None:
+        return False
+    return scene_settings.sidebar_section in section_ids
+
+
 def draw_zone_controls(layout, zone, total_length):
     _start_distance, end_distance = resolve_zone_span(zone)
 
@@ -404,12 +412,14 @@ class COASTERMIXER_PT_coaster(CoasterMixerPanelMixin, bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         scene_settings = context.scene.coaster_mixer_scene
+        track_object = resolve_active_track_object(context)
 
         row = layout.row(align=True)
         row.prop(scene_settings, "track_object", text="Root")
         row.operator("coaster_mixer.set_root_from_active", text="", icon="EYEDROPPER")
 
-        track_object = resolve_active_track_object(context)
+        layout.prop(scene_settings, "sidebar_section", expand=True)
+
         if track_object is None:
             layout.label(text="Pick a curve as the coaster root to start.", icon="INFO")
             return
@@ -421,6 +431,19 @@ class COASTERMIXER_PT_coaster(CoasterMixerPanelMixin, bpy.types.Panel):
             icon="TRACKING" if route["cyclic"] else "INFO",
         )
 
+        edit_piece = resolve_edit_piece(context)
+        if edit_piece is not None:
+            suffix = " (root)" if edit_piece == track_object else ""
+            layout.label(text=f"Editing: {edit_piece.name}{suffix}", icon="CURVE_DATA")
+
+        if is_sidebar_section_active(context, "SETUP"):
+            status_box = layout.box()
+            status_box.label(text="Quick Status", icon="CHECKMARK")
+            status_box.label(text=f"Root: {track_object.name}", icon="DOT")
+            status_box.label(text=f"Active piece: {edit_piece.name if edit_piece is not None else 'none'}", icon="DOT")
+            followers = collect_track_followers(track_object)
+            status_box.label(text=f"Followers: {len(followers)} attached", icon="DOT")
+
 
 class COASTERMIXER_PT_route(CoasterMixerPanelMixin, bpy.types.Panel):
     bl_label = "Route Pieces"
@@ -430,7 +453,7 @@ class COASTERMIXER_PT_route(CoasterMixerPanelMixin, bpy.types.Panel):
 
     @classmethod
     def poll(cls, context):
-        return resolve_active_track_object(context) is not None
+        return resolve_active_track_object(context) is not None and is_sidebar_section_active(context, "SETUP")
 
     def draw(self, context):
         layout = self.layout
@@ -459,13 +482,54 @@ class COASTERMIXER_PT_route(CoasterMixerPanelMixin, bpy.types.Panel):
             layout.label(text="Open route: the train stops at the last piece.", icon="INFO")
 
 
+class COASTERMIXER_PT_track_piece(CoasterMixerPanelMixin, bpy.types.Panel):
+    bl_label = "Track Piece"
+    bl_idname = "COASTERMIXER_PT_track_piece"
+    bl_parent_id = "COASTERMIXER_PT_coaster"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    @classmethod
+    def poll(cls, context):
+        return resolve_edit_piece(context) is not None and is_sidebar_section_active(context, "SETUP")
+
+    def draw(self, context):
+        layout = self.layout
+        piece_object, piece_settings = resolve_edit_track_settings(context)
+        if piece_object is None or piece_settings is None:
+            return
+
+        track_object = resolve_active_track_object(context)
+        suffix = " (root)" if piece_object == track_object else ""
+        layout.label(text=f"{piece_object.name}{suffix}", icon="CURVE_DATA")
+
+        spline = get_primary_spline(piece_object)
+        if spline is None:
+            layout.label(text="This curve has no spline data.", icon="ERROR")
+            return
+
+        layout.prop(piece_settings, "orientation_frame_mode")
+        if piece_settings.orientation_frame_mode == "CONTINUOUS_Z_UP":
+            layout.label(text="Matches Z Up without flipping at vertical tangents.", icon="INFO")
+        elif piece_settings.orientation_frame_mode == "MINIMUM_TWIST":
+            layout.label(text="Vertical-safe: tilt is applied as physical banking.", icon="INFO")
+        layout.prop(piece_settings, "bank_seam_mode")
+        if piece_settings.bank_seam_mode == "MANUAL":
+            layout.prop(piece_settings, "bank_seam_half_turns")
+        if spline.use_cyclic_u:
+            if piece_settings.bank_seam_mode == "AUTO":
+                layout.label(text="Matching 180°/360° winding is preserved automatically.", icon="INFO")
+            elif piece_settings.bank_seam_mode == "MANUAL":
+                seam_degrees = piece_settings.bank_seam_half_turns * 180.0
+                layout.label(text=f"Seam closes at start tilt + {seam_degrees:g}°.", icon="INFO")
+
+
 class COASTERMIXER_PT_piece(CoasterMixerPanelMixin, bpy.types.Panel):
     bl_label = "Track Hardware"
     bl_idname = "COASTERMIXER_PT_piece"
 
     @classmethod
     def poll(cls, context):
-        return resolve_edit_piece(context) is not None
+        return resolve_edit_piece(context) is not None and is_sidebar_section_active(context, "PIECE")
 
     def draw(self, context):
         layout = self.layout
@@ -476,28 +540,6 @@ class COASTERMIXER_PT_piece(CoasterMixerPanelMixin, bpy.types.Panel):
         track_object = resolve_active_track_object(context)
         suffix = "  (root)" if piece_object == track_object else ""
         layout.label(text=f"{piece_object.name}{suffix}", icon="CURVE_DATA")
-
-        spline = get_primary_spline(piece_object)
-        if spline is None:
-            layout.label(text="This curve has no spline data.", icon="ERROR")
-            return
-
-        banking_box = layout.box()
-        banking_box.label(text="Curve Banking", icon="DRIVER_ROTATIONAL_DIFFERENCE")
-        banking_box.prop(piece_settings, "orientation_frame_mode")
-        if piece_settings.orientation_frame_mode == "CONTINUOUS_Z_UP":
-            banking_box.label(text="Matches Z Up without flipping at vertical tangents.", icon="INFO")
-        elif piece_settings.orientation_frame_mode == "MINIMUM_TWIST":
-            banking_box.label(text="Vertical-safe: tilt is applied as physical banking.", icon="INFO")
-        banking_box.prop(piece_settings, "bank_seam_mode")
-        if piece_settings.bank_seam_mode == "MANUAL":
-            banking_box.prop(piece_settings, "bank_seam_half_turns")
-        if spline.use_cyclic_u:
-            if piece_settings.bank_seam_mode == "AUTO":
-                banking_box.label(text="Matching 180°/360° winding is preserved automatically.", icon="INFO")
-            elif piece_settings.bank_seam_mode == "MANUAL":
-                seam_degrees = piece_settings.bank_seam_half_turns * 180.0
-                banking_box.label(text=f"Seam closes at start tilt + {seam_degrees:g}°.", icon="INFO")
 
         layout.label(text="Actuators", icon="MODIFIER")
         row = layout.row()
@@ -562,6 +604,10 @@ class COASTERMIXER_PT_connections(CoasterMixerPanelMixin, bpy.types.Panel):
     bl_parent_id = "COASTERMIXER_PT_piece"
     bl_options = {"DEFAULT_CLOSED"}
 
+    @classmethod
+    def poll(cls, context):
+        return resolve_edit_piece(context) is not None and is_sidebar_section_active(context, "PIECE")
+
     def draw(self, context):
         layout = self.layout
         _piece_object, piece_settings = resolve_edit_track_settings(context)
@@ -597,7 +643,7 @@ class COASTERMIXER_PT_train(CoasterMixerPanelMixin, bpy.types.Panel):
 
     @classmethod
     def poll(cls, context):
-        return resolve_active_track_object(context) is not None
+        return resolve_active_track_object(context) is not None and is_sidebar_section_active(context, "TRAIN")
 
     def draw(self, context):
         layout = self.layout
@@ -650,7 +696,7 @@ class COASTERMIXER_PT_camera(CoasterMixerPanelMixin, bpy.types.Panel):
 
     @classmethod
     def poll(cls, context):
-        return resolve_active_track_object(context) is not None
+        return resolve_active_track_object(context) is not None and is_sidebar_section_active(context, "TRAIN")
 
     def draw(self, context):
         layout = self.layout
@@ -683,7 +729,7 @@ class COASTERMIXER_PT_simulation(CoasterMixerPanelMixin, bpy.types.Panel):
 
     @classmethod
     def poll(cls, context):
-        return resolve_active_track_object(context) is not None
+        return resolve_active_track_object(context) is not None and is_sidebar_section_active(context, "SIMULATION")
 
     def draw_header(self, context):
         self.layout.prop(context.scene.coaster_mixer_scene, "simulation_enabled", text="")
@@ -711,7 +757,39 @@ class COASTERMIXER_PT_simulation(CoasterMixerPanelMixin, bpy.types.Panel):
         overlay_box.prop(scene_settings, "hide_overlays_while_playing")
 
         layout.operator("coaster_mixer.reset_simulation", icon="FILE_REFRESH")
-        layout.label(text=f"Speed: {scene_settings.simulation_current_speed_mps:.2f} m/s")
+        route = get_resolved_route(track_object)
+        metrics = get_simulation_overlay_metrics(
+            context.scene,
+            track_object,
+            track_settings,
+            route,
+            track_settings.train_front_route_meters,
+            scene_settings.simulation_current_speed_mps,
+        )
+        if metrics is not None:
+            stats_box = layout.box()
+            stats_box.label(text="Live Metrics", icon="DRIVER")
+            stats_box.label(
+                text=f"Speed: {metrics['speed_mps']:.2f} m/s  |  {metrics['speed_kmh']:.1f} km/h"
+            )
+            stats_box.label(
+                text=(
+                    f"Front: {metrics['front_meters']:.2f} m"
+                    f"  |  Route: {metrics['wrapped_front_meters']:.2f} m"
+                )
+            )
+            stats_box.label(
+                text=(
+                    f"Longitudinal G: {metrics['longitudinal_g_signed']:+.2f}"
+                    f"  |  Lateral G: {metrics['lateral_g_signed']:+.2f}"
+                )
+            )
+            stats_box.label(
+                text=(
+                    f"Vertical G: {metrics['vertical_g_signed']:+.2f}"
+                    f"  |  Total G: {metrics['total_g']:.2f}"
+                )
+            )
         diagnostics = get_startup_diagnostics(context.scene, track_object, track_settings)
         if diagnostics:
             diagnostic_box = layout.box()
@@ -752,7 +830,7 @@ class COASTERMIXER_PT_blocks(CoasterMixerPanelMixin, bpy.types.Panel):
 
     @classmethod
     def poll(cls, context):
-        return resolve_active_track_object(context) is not None
+        return resolve_active_track_object(context) is not None and is_sidebar_section_active(context, "BLOCKS")
 
     def draw(self, context):
         _track_object, track_settings = resolve_active_track_settings(context)
@@ -770,9 +848,10 @@ class COASTERMIXER_PT_setup_utilities(CoasterMixerPanelMixin, bpy.types.Panel):
     @classmethod
     def poll(cls, context):
         active_object = getattr(context, "object", None)
-        return (
-            active_object is not None and active_object.type == "CURVE"
-        ) or resolve_active_track_object(context) is not None
+        return is_sidebar_section_active(context, "SETUP") and (
+            (active_object is not None and active_object.type == "CURVE")
+            or resolve_active_track_object(context) is not None
+        )
 
     def draw(self, context):
         layout = self.layout
