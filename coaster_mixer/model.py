@@ -732,12 +732,50 @@ class CoasterMixerCameraSettings(bpy.types.PropertyGroup):
         update=camera_settings_update,
     )
     shake_factor: bpy.props.FloatProperty(
-        name="Shake Factor",
-        description="Multiplier for speed- and G-driven camera shake",
+        name="Master Amount",
+        description="Overall multiplier for ride-camera shake layers",
         min=0.0,
         max=10.0,
         soft_max=3.0,
         default=1.0,
+        update=camera_settings_update,
+    )
+    shake_vibration_millimeters: bpy.props.FloatProperty(
+        name="Vibration Amount",
+        description="High-frequency vibration amount; 1.0 is calibrated to a few millimeters of camera or mount buzz",
+        min=0.0,
+        max=50.0,
+        soft_max=10.0,
+        default=1.0,
+        update=camera_settings_update,
+    )
+    shake_vibration_frequency: bpy.props.FloatProperty(
+        name="Vibration Frequency",
+        description="Multiplier for the fine vibration frequency",
+        min=0.1,
+        max=5.0,
+        soft_max=2.5,
+        default=1.0,
+        update=camera_settings_update,
+    )
+    shake_motion_factor: bpy.props.FloatProperty(
+        name="Arm Motion Amount",
+        description="Amount of slower load-driven motion, like a person guiding a camera arm through forces",
+        min=0.0,
+        max=10.0,
+        soft_max=3.0,
+        default=1.0,
+        update=camera_settings_update,
+    )
+    shake_motion_response_seconds: bpy.props.FloatProperty(
+        name="Arm Response",
+        description="Lag window in seconds for the slower load-driven motion; larger values feel more damped and hand-held",
+        min=0.0,
+        max=1.0,
+        soft_max=0.35,
+        default=0.16,
+        precision=3,
+        subtype="TIME",
         update=camera_settings_update,
     )
 

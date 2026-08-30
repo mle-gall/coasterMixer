@@ -720,6 +720,14 @@ class COASTERMIXER_PT_camera(CoasterMixerPanelMixin, bpy.types.Panel):
             shake_column = column.column()
             shake_column.enabled = settings.shake_enabled
             shake_column.prop(settings, "shake_factor")
+            shake_column.separator()
+            shake_column.label(text="Fine Vibration", icon="MOD_NOISE")
+            shake_column.prop(settings, "shake_vibration_millimeters")
+            shake_column.prop(settings, "shake_vibration_frequency")
+            shake_column.separator()
+            shake_column.label(text="Arm Motion", icon="CON_TRACKTO")
+            shake_column.prop(settings, "shake_motion_factor")
+            shake_column.prop(settings, "shake_motion_response_seconds")
         layout.operator("coaster_mixer.create_train_camera", text="Create Ride Camera", icon="OUTLINER_OB_CAMERA")
 
 

@@ -2224,11 +2224,15 @@ def collect_ride_cameras(track_object):
     return cameras
 
 
-def get_camera_shake_offset(track_object, camera_object, mount_rotation, route, front_meters):
-    """Return deterministic, local camera jitter driven by speed and track load."""
+def get_camera_shake_state(track_object, camera_object, route, front_meters):
+    """Return local camera shake offsets plus framing bias from ride loads."""
     camera_settings = getattr(camera_object, "coaster_mixer_camera", None)
     if camera_settings is None or not camera_settings.shake_enabled:
-        return Vector((0.0, 0.0, 0.0))
+        return {
+            "position_offset": Vector((0.0, 0.0, 0.0)),
+            "aim_offset": Vector((0.0, 0.0, 0.0)),
+            "roll_radians": 0.0,
+        }
 
     scene = getattr(bpy.context, "scene", None)
     scene_settings = getattr(scene, "coaster_mixer_scene", None)
@@ -2236,30 +2240,127 @@ def get_camera_shake_offset(track_object, camera_object, mount_rotation, route, 
     if scene_settings is not None and scene_settings.track_object == track_object:
         speed = max(scene_settings.simulation_current_speed_mps, 0.0)
     if speed <= SIMULATION_STOP_EPSILON:
-        return Vector((0.0, 0.0, 0.0))
+        return {
+            "position_offset": Vector((0.0, 0.0, 0.0)),
+            "aim_offset": Vector((0.0, 0.0, 0.0)),
+            "roll_radians": 0.0,
+        }
 
-    curvature_acceleration = sample_route_curvature_vector(route, front_meters) * (speed * speed)
-    mount_side = mount_rotation @ Vector((1.0, 0.0, 0.0))
-    mount_up = mount_rotation @ Vector((0.0, 0.0, 1.0))
-    lateral_g = abs(curvature_acceleration.dot(mount_side)) / GRAVITY_ACCELERATION
-    apparent_acceleration = curvature_acceleration - Vector((0.0, 0.0, -GRAVITY_ACCELERATION))
-    vertical_g = abs(apparent_acceleration.dot(mount_up)) / GRAVITY_ACCELERATION
-    load_change = abs(vertical_g - 1.0)
-
-    amplitude = camera_settings.shake_factor * (
-        0.006 * clamp(speed / 25.0, 0.0, 2.0)
-        + 0.004 * clamp(lateral_g, 0.0, 3.0)
-        + 0.003 * clamp(load_change, 0.0, 3.0)
-    )
-    amplitude = min(amplitude, 0.08)
-    phase = front_meters
-    return Vector(
+    master_amount = camera_settings.shake_factor * 0.5
+    vibration_amplitude = 0.0015 * camera_settings.shake_vibration_millimeters * master_amount
+    vibration_speed_factor = 0.35 + 0.65 * clamp(speed / 25.0, 0.0, 1.5)
+    vibration_phase = front_meters * camera_settings.shake_vibration_frequency
+    vibration_offset = Vector(
         (
-            amplitude * (0.65 * sin(phase * 19.7) + 0.35 * sin(phase * 43.1 + 0.8)),
-            amplitude * 0.35 * sin(phase * 31.3 + 2.1),
-            amplitude * (0.7 * sin(phase * 23.9 + 1.4) + 0.3 * sin(phase * 52.7)),
+            vibration_amplitude
+            * vibration_speed_factor
+            * (0.45 * sin(vibration_phase * 43.0) + 0.20 * sin(vibration_phase * 91.0 + 0.8)),
+            vibration_amplitude
+            * vibration_speed_factor
+            * (0.18 * sin(vibration_phase * 57.0 + 2.1)),
+            vibration_amplitude
+            * vibration_speed_factor
+            * (0.70 * sin(vibration_phase * 49.0 + 1.4) + 0.30 * sin(vibration_phase * 103.0)),
         )
     )
+    vibration_aim_offset = Vector(
+        (
+            vibration_amplitude
+            * vibration_speed_factor
+            * (1.7 * sin(vibration_phase * 61.0 + 0.2) + 0.7 * sin(vibration_phase * 127.0 + 1.0)),
+            vibration_amplitude
+            * vibration_speed_factor
+            * (1.1 * sin(vibration_phase * 53.0 + 2.4)),
+            vibration_amplitude
+            * vibration_speed_factor
+            * (1.5 * sin(vibration_phase * 69.0 + 1.3) + 0.5 * sin(vibration_phase * 141.0)),
+        )
+    )
+    vibration_roll_radians = vibration_speed_factor * (
+        0.0028 * sin(vibration_phase * 73.0 + 0.5)
+        + 0.0012 * sin(vibration_phase * 149.0 + 1.8)
+    )
+
+    scene = getattr(bpy.context, "scene", None)
+    if scene is None:
+        return {
+            "position_offset": vibration_offset,
+            "aim_offset": vibration_aim_offset,
+            "roll_radians": vibration_roll_radians,
+        }
+
+    current_frame = int(getattr(scene, "frame_current", 0))
+    response_frames = int(
+        round(max(camera_settings.shake_motion_response_seconds, 0.0) * max(get_scene_fps(scene), 1.0))
+    )
+    motion_amount = camera_settings.shake_motion_factor * 0.5
+    weighted_offset = Vector((0.0, 0.0, 0.0))
+    weighted_lateral_g = 0.0
+    weighted_longitudinal_g = 0.0
+    weighted_vertical_delta_g = 0.0
+    total_weight = 0.0
+    for frame_offset in range(max(response_frames, 0) + 1):
+        sample = sample_simulation_trajectory(
+            scene,
+            track_object,
+            track_object.coaster_mixer_track,
+            current_frame - frame_offset,
+        )
+        if sample is None:
+            continue
+        sample_front, sample_speed, _stop_remaining = sample
+        load_metrics = get_simulation_overlay_metrics(
+            scene,
+            track_object,
+            track_object.coaster_mixer_track,
+            route,
+            sample_front,
+            sample_speed,
+        )
+        if load_metrics is None:
+            continue
+
+        # Model a camera arm lagging behind apparent forces rather than
+        # vibrating directly with them.
+        target_offset = Vector(
+            (
+                -0.010 * clamp(load_metrics["lateral_g_signed"], -3.0, 3.0),
+                -0.012 * clamp(load_metrics["longitudinal_g_signed"], -3.0, 3.0),
+                -0.008 * clamp(load_metrics["vertical_g_signed"] - 1.0, -3.0, 3.0),
+            )
+        ) * (motion_amount * master_amount)
+        weight = float(response_frames + 1 - frame_offset)
+        weighted_offset += target_offset * weight
+        weighted_lateral_g += load_metrics["lateral_g_signed"] * weight
+        weighted_longitudinal_g += load_metrics["longitudinal_g_signed"] * weight
+        weighted_vertical_delta_g += (load_metrics["vertical_g_signed"] - 1.0) * weight
+        total_weight += weight
+
+    motion_offset = weighted_offset / total_weight if total_weight > 0.0 else Vector((0.0, 0.0, 0.0))
+    average_lateral_g = weighted_lateral_g / total_weight if total_weight > 0.0 else 0.0
+    average_longitudinal_g = weighted_longitudinal_g / total_weight if total_weight > 0.0 else 0.0
+    average_vertical_delta_g = weighted_vertical_delta_g / total_weight if total_weight > 0.0 else 0.0
+
+    # Handheld or arm-mounted framing lags the train: use the slower motion
+    # layer to bias aim as well as position, instead of keeping the target
+    # perfectly rigid.
+    aim_offset = Vector(
+        (
+            -0.040 * clamp(average_lateral_g, -3.0, 3.0),
+            -0.060 * clamp(average_longitudinal_g, -3.0, 3.0),
+            -0.045 * clamp(average_vertical_delta_g, -3.0, 3.0),
+        )
+    ) * (motion_amount * master_amount)
+    roll_radians = (
+        -0.035 * clamp(average_lateral_g, -3.0, 3.0)
+        -0.015 * clamp(average_longitudinal_g, -3.0, 3.0)
+    ) * (motion_amount * master_amount)
+
+    return {
+        "position_offset": vibration_offset + motion_offset,
+        "aim_offset": vibration_aim_offset + aim_offset,
+        "roll_radians": vibration_roll_radians + roll_radians,
+    }
 
 
 def get_simulation_overlay_metrics(scene, track_object, track_settings, route, front_meters, speed_mps):
@@ -2331,16 +2432,19 @@ def place_ride_cameras(track_object, placement_by_object, route, front_meters):
         mount_location, mount_rotation = mount_sample
         target_location, _target_rotation = target_sample
         camera_settings = getattr(camera_object, "coaster_mixer_camera", None)
+        shake_state = None
         if camera_settings is not None and camera_settings.track_object == track_object:
             base_offset = Vector(camera_settings.offset_xyz)
-            camera_object.location = base_offset + get_camera_shake_offset(
+            shake_state = get_camera_shake_state(
                 track_object,
                 camera_object,
-                mount_rotation,
                 route,
                 front_meters,
             )
+            camera_object.location = base_offset + shake_state["position_offset"]
         camera_location = mount_location + mount_rotation @ camera_object.location
+        if shake_state is not None:
+            target_location = target_location + mount_rotation @ shake_state["aim_offset"]
         forward = target_location - camera_location
         if forward.length_squared <= 1.0e-10:
             continue
@@ -2352,6 +2456,8 @@ def place_ride_cameras(track_object, placement_by_object, route, front_meters):
             mount_side = mount_rotation @ Vector((1.0, 0.0, 0.0))
             camera_up = mount_side.cross(forward)
         camera_up.normalize()
+        if shake_state is not None and abs(shake_state["roll_radians"]) > 1.0e-8:
+            camera_up.rotate(Quaternion(forward, shake_state["roll_radians"]))
         camera_back = -forward  # Blender cameras look along local -Z.
         camera_right = camera_up.cross(camera_back).normalized()
         camera_up = camera_back.cross(camera_right).normalized()
