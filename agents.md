@@ -15,7 +15,7 @@
 - The train front is `coaster_mixer_track.train_front_route_meters` on the root piece — meters along the route, deliberately not normalized so switch changes don't teleport the train.
 - Train placement is arc-length accurate: follower empties carry location/rotation drivers calling the `cm_place` driver-namespace function, which samples the route's cached length tables (no Follow Path constraint — that evaluates parametrically and distorts speed). Followers trail the front by per-empty offsets in meters (`Object.coaster_mixer_follower`), banking taken from curve tilt.
 - The N-panel edits zones/connections on the active viewport curve ("edit piece"), while train/simulation settings live on the root.
-- Live playback is a deterministic function of the timeline: `frame_start` is t0 (train at Start Position, speed 0), each frame advances one 1/fps step, and samples are memoized in a module-level trajectory cache. Once the quantized sim state recurs (stops and captures snap to frame boundaries to guarantee exact recurrence on circuits with blocks), playback loops on the detected cycle — scrubbing either direction and playing past the cycle end are O(1) lookups. Baking writes the same trajectory to keyframes.
+- Live playback is a deterministic function of the timeline: frame `0` is t0 (train at Start Position, speed 0), each frame advances one 1/fps step, and samples are memoized in a module-level trajectory cache. Once the quantized sim state recurs (stops and captures snap to frame boundaries to guarantee exact recurrence on circuits with blocks), playback loops on the detected cycle — scrubbing either direction and playing past the cycle end are O(1) lookups. Baking writes the same trajectory to keyframes.
 - Start-at-station principle: the track conceptually starts at the station exit; the start cursor (`simulation_start_route_meters`, drawn as a green viewport arrow) is normally snapped to the last block's last move point via the Start at Station operator, so the train begins parked in the station at the end of the track and runs the remaining block actions before dispatch.
 - Known limitation: switch keyframes are not sampled by the trajectory (animation writes don't fire property updates, so the cached route keeps the values it was resolved with). Throwing a switch as an edit rebuilds the preview from t0 with the new topology.
 - Coast losses: rolling friction (coefficient on the root) plus aerodynamic drag (0.5 * rho * CdA * v^2, `drag_area_m2` on the root).
@@ -26,6 +26,17 @@
 - Prefer storing authored coaster data on the selected curve object, not globally on the scene, except for UI state such as the active curve reference.
 - Favor normalized curve positions for authoring data first; add derived world-space helpers on top.
 - Treat the first spline of the selected curve as the working track until multi-spline support is added deliberately.
+
+## Release Process
+- Release from `main` only after the working tree is clean and the intended changes are committed.
+- Keep prerelease packaging aligned with the Blender extension manifest in `coaster_mixer/blender_manifest.toml`; bump that `version` in its own commit after the feature/fix commit(s).
+- Preserve the existing tag format: `v<manifest-version>` such as `v0.3.0-alpha.7`.
+- Before publishing, run `python3 -m py_compile coaster_mixer/*.py` and rebuild the extension archive with `python3 scripts/build_addon.py`.
+- The packaged asset must come from `dist/coaster_mixer-<manifest-version>.zip`, produced by `scripts/build_addon.py`; do not hand-roll a different ZIP layout.
+- Push `main`, create the matching git tag on the manifest bump commit, and push that tag to `origin`.
+- Publish prereleases with GitHub CLI so they match prior alpha drops: title `Coaster Mixer v<manifest-version>`, tag `v<manifest-version>`, `--prerelease`, and attach `dist/coaster_mixer-<manifest-version>.zip`.
+- Release notes should be short and practical: one sentence describing the alpha focus, a short `Highlights:` list, and an install line mentioning the exact ZIP filename.
+- The GitHub Actions workflow in `.github/workflows/build-addon.yml` only builds and uploads artifacts on `main`; it does not create the GitHub release. Creating the tag alone is not sufficient.
 
 ## Near-Term Next Steps
 - Replace the prototype boundary gizmo with a curve-aware interface gizmo that sits directly on the segment seam.

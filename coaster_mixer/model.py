@@ -634,6 +634,17 @@ class CoasterMixerFollowerSettings(bpy.types.PropertyGroup):
         default=False,
         update=follower_settings_update,
     )
+    train_role: bpy.props.EnumProperty(
+        name="Train Role",
+        description="How this attached empty participates in the imported train rig",
+        items=(
+            ("MOUNT", "Mount", "Standard train mount empty carried along the track"),
+            ("IK_LEADER", "IK Leader", "Lead controller empty for an imported IK chain train"),
+            ("IK_TARGET", "IK Target", "Trailing IK target empty carried along the track"),
+        ),
+        default="MOUNT",
+        update=follower_settings_update,
+    )
     source_mount_object: bpy.props.PointerProperty(
         name="Source Mount",
         description="Main train empty this helper follows for its longitudinal placement",
@@ -827,6 +838,33 @@ class CoasterMixerTrackSettings(bpy.types.PropertyGroup):
         default=10.0,
         update=track_settings_update,
     )
+    train_mount_placement_mode: bpy.props.EnumProperty(
+        name="Car Mount Placement",
+        description="How main train mount empties are placed along the track",
+        items=TRAIN_MOUNT_PLACEMENT_MODE_ITEMS,
+        default="ARCLENGTH",
+        update=track_settings_update,
+    )
+    train_rig_mode: bpy.props.EnumProperty(
+        name="Rig Mode",
+        description="How the imported train controllers are interpreted",
+        items=TRAIN_RIG_MODE_ITEMS,
+        default="STANDARD",
+        update=track_settings_update,
+    )
+    train_mount_axis_preset: bpy.props.EnumProperty(
+        name="Empty Axes",
+        description="Local axis orientation expected by imported train mount empties",
+        items=TRAIN_MOUNT_AXIS_PRESET_ITEMS,
+        default="Y_FORWARD_Z_UP",
+        update=track_settings_update,
+    )
+    train_mounts_reversed: bpy.props.BoolProperty(
+        name="Flip Train",
+        description="Reverse the train rig orientation along the track without changing the inferred empty axis preset",
+        default=False,
+        update=track_settings_update,
+    )
     train_weight_kilograms: bpy.props.FloatProperty(
         name="Train Weight",
         description="Approximate full train mass used by gravity sections",
@@ -967,6 +1005,56 @@ class CoasterMixerSceneSettings(bpy.types.PropertyGroup):
         name="Selected Control Node",
         description="Show the influence and target feedback for the selected control node",
         default=True,
+        update=scene_display_update,
+    )
+    show_force_overlays: bpy.props.BoolProperty(
+        name="Forces",
+        description="Show vertical and lateral force spikes sampled along the simulated route",
+        default=False,
+        update=scene_display_update,
+    )
+    show_vertical_force_overlays: bpy.props.BoolProperty(
+        name="Vertical",
+        description="Draw vertical-force spikes along the route",
+        default=True,
+        update=scene_display_update,
+    )
+    show_lateral_force_overlays: bpy.props.BoolProperty(
+        name="Lateral",
+        description="Draw lateral-force spikes along the route",
+        default=True,
+        update=scene_display_update,
+    )
+    force_overlay_step_meters: bpy.props.FloatProperty(
+        name="Sample Step",
+        description="Distance between force samples drawn along the route",
+        min=0.05,
+        soft_min=0.1,
+        soft_max=1.0,
+        subtype="DISTANCE",
+        default=0.25,
+        precision=3,
+        update=scene_display_update,
+    )
+    force_overlay_scale_meters: bpy.props.FloatProperty(
+        name="Spike Scale",
+        description="Viewport length contributed by one G of force",
+        min=0.01,
+        soft_min=0.05,
+        soft_max=2.0,
+        subtype="DISTANCE",
+        default=0.35,
+        precision=3,
+        update=scene_display_update,
+    )
+    force_overlay_max_g: bpy.props.FloatProperty(
+        name="Color / Length Clamp",
+        description="Maximum absolute G used to clamp force spike color and length",
+        min=0.25,
+        soft_min=1.0,
+        soft_max=8.0,
+        default=4.0,
+        precision=2,
         update=scene_display_update,
     )
     hide_overlays_while_playing: bpy.props.BoolProperty(

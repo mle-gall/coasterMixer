@@ -675,7 +675,11 @@ class COASTERMIXER_PT_train(CoasterMixerPanelMixin, bpy.types.Panel):
         rig_column = rig_box.column()
         rig_column.use_property_split = True
         rig_column.use_property_decorate = False
+        rig_column.prop(track_settings, "train_rig_mode")
         rig_column.prop(track_settings, "driven_empty_object")
+        rig_column.prop(track_settings, "train_mount_placement_mode")
+        rig_column.prop(track_settings, "train_mount_axis_preset")
+        rig_column.prop(track_settings, "train_mounts_reversed")
         rig_column.prop(track_settings, "train_mount_vertical_offset_meters")
 
         if track_settings.driven_empty_object is not None:
@@ -683,29 +687,27 @@ class COASTERMIXER_PT_train(CoasterMixerPanelMixin, bpy.types.Panel):
         rig_box.label(text=get_follower_setup_status(track_object, track_settings.driven_empty_object))
         if track_settings.driven_empty_object is not None:
             rig_box.label(text=f"Lead anchor: {track_settings.driven_empty_object.name} @ 0.00 m", icon="EMPTY_AXIS")
-            rig_column.prop(track_settings.driven_empty_object.coaster_mixer_follower, "reverse_forward_axis", text="Lead Facing Backward")
             rig_box.label(text="Uses the same Car Mount Height as the rest of the train.", icon="INFO")
+        if track_settings.train_mount_placement_mode == "ARTICULATED":
+            rig_box.label(text="Trailing mounts solve coupler distance in world space on the mount path.", icon="CON_TRACKTO")
 
         follower_box = layout.box()
-        follower_box.label(text="Car Mounts", icon="LINKED")
+        follower_label = "IK Targets" if track_settings.train_rig_mode == "IK_CHAIN" else "Car Mounts"
+        follower_box.label(text=follower_label, icon="LINKED")
         mounts = collect_track_followers(track_object)
         if mounts:
             for mount_index, follower_object in enumerate(mounts):
                 length_meters = get_train_mount_length_meters(mounts, mount_index)
+                role_identifier = getattr(follower_object.coaster_mixer_follower, "train_role", "MOUNT")
+                role_label = "IK Target" if role_identifier == "IK_TARGET" else "Mount"
                 row = follower_box.row(align=True)
-                row.label(text=follower_object.name, icon="EMPTY_AXIS")
+                row.label(text=f"{follower_object.name} ({role_label})", icon="EMPTY_AXIS")
                 edit = row.operator(
                     "coaster_mixer.edit_train_mount_length",
                     text=f"{length_meters:.2f} m",
                     icon="DRIVER_DISTANCE",
                 )
                 edit.empty_name = follower_object.name
-                row.prop(
-                    follower_object.coaster_mixer_follower,
-                    "reverse_forward_axis",
-                    text="",
-                    icon="ARROW_LEFTRIGHT",
-                )
                 detach = row.operator("coaster_mixer.detach_follower", text="Remove", icon="X")
                 detach.empty_name = follower_object.name
         else:
@@ -717,6 +719,7 @@ class COASTERMIXER_PT_train(CoasterMixerPanelMixin, bpy.types.Panel):
             icon="OUTLINER_OB_EMPTY",
         )
         button_row.operator("coaster_mixer.attach_selected_followers", text="Attach Selected Empties", icon="LINKED")
+        follower_box.operator("coaster_mixer.attach_selected_ik_chain", text="Attach IK Chain Train", icon="CONSTRAINT_BONE")
 
         wheelcarrier_box = layout.box()
         wheelcarrier_box.label(text="Wheelcarrier Helpers", icon="EMPTY_AXIS")
@@ -807,7 +810,18 @@ class COASTERMIXER_PT_simulation(CoasterMixerPanelMixin, bpy.types.Panel):
         overlay_row = overlay_box.row(align=True)
         overlay_row.prop(scene_settings, "show_hardware_overlays", toggle=True)
         overlay_row.prop(scene_settings, "show_block_overlays", toggle=True)
+        overlay_row.prop(scene_settings, "show_force_overlays", toggle=True)
         overlay_box.prop(scene_settings, "show_control_overlays")
+        if scene_settings.show_force_overlays:
+            force_column = overlay_box.column()
+            force_column.use_property_split = True
+            force_column.use_property_decorate = False
+            direction_row = force_column.row(align=True)
+            direction_row.prop(scene_settings, "show_vertical_force_overlays", toggle=True)
+            direction_row.prop(scene_settings, "show_lateral_force_overlays", toggle=True)
+            force_column.prop(scene_settings, "force_overlay_step_meters")
+            force_column.prop(scene_settings, "force_overlay_scale_meters")
+            force_column.prop(scene_settings, "force_overlay_max_g")
         overlay_box.prop(scene_settings, "hide_overlays_while_playing")
 
         layout.operator("coaster_mixer.reset_simulation", icon="FILE_REFRESH")

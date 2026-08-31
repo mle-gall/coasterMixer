@@ -772,9 +772,9 @@ class COASTERMIXER_OT_attach_selected_followers(bpy.types.Operator):
     bl_description = "Attach the selected empties to the active track as train car mounts, preserving their current spacing"
     bl_options = {"REGISTER", "UNDO"}
 
-    reverse_facing: bpy.props.BoolProperty(
-        name="Face Backward",
-        description="Flip the selected empties 180 degrees around their local up axis when attaching",
+    flip_train: bpy.props.BoolProperty(
+        name="Flip Train",
+        description="Reverse the inferred front/back direction of the selected empty chain",
         default=False,
     )
     adjust_train_length: bpy.props.BoolProperty(
@@ -794,14 +794,27 @@ class COASTERMIXER_OT_attach_selected_followers(bpy.types.Operator):
         return track_object is not None
 
     def invoke(self, context, _event):
+        self._preview_state = capture_attach_preview_state(context)
+        self._apply_preview(context)
         return context.window_manager.invoke_props_dialog(self, width=420)
+
+    def check(self, context):
+        self._apply_preview(context)
+        return True
+
+    def cancel(self, context):
+        restore_attach_preview_state(self._preview_state)
+        tag_redraw_view3d()
 
     def draw(self, context):
         layout = self.layout
-        track_object, _track_settings = resolve_active_track_settings(context)
+        track_object, track_settings = resolve_active_track_settings(context)
         selected_empties = [object_ref for object_ref in context.selected_objects if object_ref.type == "EMPTY"]
-        front_empty = get_selected_train_front_empty(context, selected_empties)
-        ordered_empties, mount_lengths, added_length = infer_selected_mount_layout(selected_empties, front_empty)
+        import_layout = infer_selected_mount_layout(selected_empties, flip_train=self.flip_train)
+        front_empty = import_layout["front_empty"]
+        ordered_empties = import_layout["ordered_empties"]
+        mount_lengths = import_layout["mount_lengths"]
+        added_length = import_layout["total_length"]
 
         mounts = collect_track_followers(track_object) if track_object is not None else []
         current_total_length = get_train_mount_total_length_meters(mounts)
@@ -810,12 +823,18 @@ class COASTERMIXER_OT_attach_selected_followers(bpy.types.Operator):
         column = layout.column()
         column.use_property_split = True
         column.use_property_decorate = False
-        column.prop(self, "reverse_facing")
+        column.prop(self, "flip_train")
 
         summary = layout.box()
         summary.label(text=f"Selected empties: {len(ordered_empties)}", icon="OUTLINER_OB_EMPTY")
         if front_empty is not None:
-            summary.label(text=f"Front empty: {front_empty.name}", icon="EMPTY_AXIS")
+            summary.label(text=f"Inferred front: {front_empty.name}", icon="EMPTY_AXIS")
+        if track_settings is not None:
+            axis_label = next(
+                (label for identifier, label, _description in TRAIN_MOUNT_AXIS_PRESET_ITEMS if identifier == import_layout["axis_preset"]),
+                import_layout["axis_preset"],
+            )
+            summary.label(text=f"Detected empty axes: {axis_label}", icon="ORIENTATION_GLOBAL")
         if mount_lengths:
             summary.label(text="Imported lengths: " + ", ".join(f"{length:.2f} m" for length in mount_lengths[:6]))
             if len(mount_lengths) > 6:
@@ -836,6 +855,21 @@ class COASTERMIXER_OT_attach_selected_followers(bpy.types.Operator):
         else:
             summary.label(text="No adjustable Station ending at the coaster start.", icon="INFO")
 
+    def _apply_preview(self, context):
+        track_object, track_settings = resolve_active_track_settings(context)
+        if track_object is None or track_settings is None:
+            return
+        selected_empties = [object_ref for object_ref in context.selected_objects if object_ref.type == "EMPTY"]
+        import_layout = infer_selected_mount_layout(selected_empties, flip_train=self.flip_train)
+        apply_inferred_train_attach(
+            track_object,
+            track_settings,
+            import_layout,
+            reverse_facing=self.flip_train,
+            rig_mode="STANDARD",
+        )
+        tag_redraw_view3d()
+
     def execute(self, context):
         track_object, track_settings = resolve_active_track_settings(context)
         selected_empties = [
@@ -847,27 +881,25 @@ class COASTERMIXER_OT_attach_selected_followers(bpy.types.Operator):
             self.report({"WARNING"}, "Select one or more empty objects first")
             return {"CANCELLED"}
 
-        front_empty = get_selected_train_front_empty(context, selected_empties)
+        import_layout = infer_selected_mount_layout(selected_empties, flip_train=self.flip_train)
+        front_empty = import_layout["front_empty"]
+        ordered_empties = import_layout["ordered_empties"]
+        mount_lengths = import_layout["mount_lengths"]
         if front_empty is None:
-            self.report({"WARNING"}, "Select an active empty to use as the train front")
+            self.report({"WARNING"}, "Could not infer a train line from the selected empties")
             return {"CANCELLED"}
-        ordered_empties, mount_lengths, _added_length = infer_selected_mount_layout(selected_empties, front_empty)
+        assign_rna_property(track_settings, "train_mount_axis_preset", import_layout["axis_preset"])
 
         previous_front = track_settings.driven_empty_object
         if previous_front is not None and previous_front != front_empty:
             remove_follower_drivers(previous_front)
-        assign_rna_property(track_settings, "driven_empty_object", front_empty)
-        ensure_follower_drivers(track_object, front_empty, offset_meters=0.0)
-        front_empty.coaster_mixer_follower.reverse_forward_axis = self.reverse_facing
-        mark_train_mount(front_empty, enabled=False)
-        existing_mounts = collect_track_followers(track_object)
-        base_offset = get_train_mount_total_length_meters(existing_mounts)
-        running_offset = base_offset
-        for empty_object, length_meters in zip(ordered_empties, mount_lengths):
-            running_offset += length_meters
-            ensure_follower_drivers(track_object, empty_object, offset_meters=running_offset)
-            empty_object.coaster_mixer_follower.reverse_forward_axis = self.reverse_facing
-            mark_train_mount(empty_object)
+        running_offset = apply_inferred_train_attach(
+            track_object,
+            track_settings,
+            import_layout,
+            reverse_facing=self.flip_train,
+            rig_mode="STANDARD",
+        )
 
         proposed_total_length = running_offset
         if self.adjust_train_length:
@@ -883,8 +915,159 @@ class COASTERMIXER_OT_attach_selected_followers(bpy.types.Operator):
         tag_track_placement_update(track_object)
         tag_redraw_view3d()
         train_message = f"; train length set to {proposed_total_length:.2f} m" if self.adjust_train_length else ""
-        reverse_message = "; facing backward" if self.reverse_facing else ""
+        reverse_message = "; train flipped" if self.flip_train else ""
         self.report({"INFO"}, f"Attached {len(ordered_empties)} train mounts behind {front_empty.name}{reverse_message}{train_message}{station_message}")
+        self._preview_state = None
+        return {"FINISHED"}
+
+
+class COASTERMIXER_OT_attach_selected_ik_chain(bpy.types.Operator):
+    bl_idname = "coaster_mixer.attach_selected_ik_chain"
+    bl_label = "Attach IK Chain Train"
+    bl_description = "Attach the active empty as the train leader and the other selected empties as ordered IK targets"
+    bl_options = {"REGISTER", "UNDO"}
+
+    flip_train: bpy.props.BoolProperty(
+        name="Flip Train",
+        description="Reverse the interpreted train direction while keeping the active empty as the imported leader",
+        default=False,
+    )
+    adjust_train_length: bpy.props.BoolProperty(
+        name="Set Train Length",
+        description="Update the physical train length to match the imported IK chain",
+        default=True,
+    )
+    adjust_station_length: bpy.props.BoolProperty(
+        name="Resize Station to Train",
+        description="Match the seam Station to the resulting train length by moving its entry backward while keeping its exit at the coaster start",
+        default=True,
+    )
+
+    @classmethod
+    def poll(cls, context):
+        track_object, _track_settings = resolve_active_track_settings(context)
+        active_object = getattr(context.view_layer.objects, "active", None)
+        return (
+            track_object is not None
+            and active_object is not None
+            and active_object.type == "EMPTY"
+            and sum(1 for object_ref in context.selected_objects if object_ref.type == "EMPTY") >= 2
+        )
+
+    def invoke(self, context, _event):
+        self._preview_state = capture_attach_preview_state(context)
+        self._apply_preview(context)
+        return context.window_manager.invoke_props_dialog(self, width=440)
+
+    def check(self, context):
+        self._apply_preview(context)
+        return True
+
+    def cancel(self, context):
+        restore_attach_preview_state(self._preview_state)
+        tag_redraw_view3d()
+
+    def draw(self, context):
+        layout = self.layout
+        track_object, _track_settings = resolve_active_track_settings(context)
+        selected_empties = [object_ref for object_ref in context.selected_objects if object_ref.type == "EMPTY"]
+        import_layout = infer_selected_ik_chain_layout(context, selected_empties, flip_train=self.flip_train)
+        leader_empty = import_layout["leader_empty"]
+        ik_targets = import_layout["ordered_empties"]
+        mount_lengths = import_layout["mount_lengths"]
+        orientation_check = import_layout["orientation_check"]
+
+        current_total_length = get_train_mount_total_length_meters(collect_track_followers(track_object)) if track_object is not None else 0.0
+        proposed_total_length = current_total_length + import_layout["total_length"]
+
+        column = layout.column()
+        column.use_property_split = True
+        column.use_property_decorate = False
+        column.prop(self, "flip_train")
+
+        summary = layout.box()
+        if leader_empty is not None:
+            summary.label(text=f"Leader: {leader_empty.name}", icon="EMPTY_AXIS")
+        summary.label(text=f"IK targets: {len(ik_targets)}", icon="CONSTRAINT_BONE")
+        axis_label = next(
+            (label for identifier, label, _description in TRAIN_MOUNT_AXIS_PRESET_ITEMS if identifier == import_layout["axis_preset"]),
+            import_layout["axis_preset"],
+        )
+        summary.label(text=f"Detected empty axes: {axis_label}", icon="ORIENTATION_GLOBAL")
+        if orientation_check["mismatch_count"] > 0:
+            summary.label(
+                text=f"Orientation mismatch on {orientation_check['mismatch_count']} empties; leader and targets should share axes.",
+                icon="ERROR",
+            )
+        if mount_lengths:
+            summary.label(text="Target gaps: " + ", ".join(f"{length:.2f} m" for length in mount_lengths[:6]))
+            if len(mount_lengths) > 6:
+                summary.label(text=f"... and {len(mount_lengths) - 6} more")
+        summary.label(text=f"Train length: {current_total_length:.2f} m -> {proposed_total_length:.2f} m", icon="DRIVER_DISTANCE")
+        summary.prop(self, "adjust_train_length")
+
+        station = get_adjustable_seam_station(track_object) if track_object is not None else None
+        station_column = summary.column()
+        station_column.enabled = station is not None
+        station_column.prop(self, "adjust_station_length")
+        if station is not None:
+            station_length = min(proposed_total_length, station["maximum_length"])
+            station_column.label(text=f"Station: {station['current_length']:.2f} m -> {station_length:.2f} m")
+
+    def _apply_preview(self, context):
+        track_object, track_settings = resolve_active_track_settings(context)
+        if track_object is None or track_settings is None:
+            return
+        selected_empties = [object_ref for object_ref in context.selected_objects if object_ref.type == "EMPTY"]
+        import_layout = infer_selected_ik_chain_layout(context, selected_empties, flip_train=self.flip_train)
+        apply_inferred_train_attach(
+            track_object,
+            track_settings,
+            import_layout,
+            reverse_facing=self.flip_train,
+            rig_mode="IK_CHAIN",
+        )
+        tag_redraw_view3d()
+
+    def execute(self, context):
+        track_object, track_settings = resolve_active_track_settings(context)
+        selected_empties = [object_ref for object_ref in context.selected_objects if object_ref.type == "EMPTY"]
+        if len(selected_empties) < 2:
+            self.report({"WARNING"}, "Select the leader empty plus at least one IK target empty")
+            return {"CANCELLED"}
+        import_layout = infer_selected_ik_chain_layout(context, selected_empties, flip_train=self.flip_train)
+        leader_empty = import_layout["leader_empty"]
+        if leader_empty is None:
+            self.report({"WARNING"}, "The active empty must be the IK chain leader")
+            return {"CANCELLED"}
+        orientation_check = import_layout["orientation_check"]
+        if orientation_check["mismatch_count"] > 0:
+            self.report({"WARNING"}, "Leader and IK target empties do not share a consistent axis orientation")
+            restore_attach_preview_state(self._preview_state)
+            return {"CANCELLED"}
+
+        running_offset = apply_inferred_train_attach(
+            track_object,
+            track_settings,
+            import_layout,
+            reverse_facing=self.flip_train,
+            rig_mode="IK_CHAIN",
+        )
+        if self.adjust_train_length:
+            track_settings.train_length_meters = running_offset
+
+        station_message = ""
+        if self.adjust_station_length:
+            station = get_adjustable_seam_station(track_object)
+            if station is not None:
+                station_length = resize_seam_station(station, running_offset)
+                station_message = f"; Station resized backward to {station_length:.2f} m"
+
+        tag_track_placement_update(track_object)
+        tag_redraw_view3d()
+        reverse_message = "; train flipped" if self.flip_train else ""
+        self.report({"INFO"}, f"Attached IK chain with leader {leader_empty.name} and {len(import_layout['ordered_empties'])} targets{reverse_message}{station_message}")
+        self._preview_state = None
         return {"FINISHED"}
 
 
@@ -975,47 +1158,217 @@ def resize_seam_station(station, requested_length):
     return new_length
 
 
-def get_selected_train_front_empty(context, selected_empties):
-    active_object = getattr(context.view_layer.objects, "active", None)
-    if active_object is not None and active_object.type == "EMPTY" and active_object in selected_empties:
-        return active_object
-    return selected_empties[0] if selected_empties else None
+def capture_attach_preview_object_state(object_ref):
+    if object_ref is None:
+        return None
+    follower_settings = object_ref.coaster_mixer_follower
+    return {
+        "object": object_ref,
+        "track_object": follower_settings.track_object,
+        "offset_meters": follower_settings.offset_meters,
+        "vertical_offset_meters": follower_settings.vertical_offset_meters,
+        "reverse_forward_axis": follower_settings.reverse_forward_axis,
+        "train_role": follower_settings.train_role,
+        "source_mount_object": follower_settings.source_mount_object,
+        "rotation_mode": object_ref.rotation_mode,
+        "location": object_ref.location.copy(),
+        "rotation_euler": object_ref.rotation_euler.copy(),
+        "batched_placement": bool(object_ref.get("coaster_mixer_batched_placement", False)),
+        "train_mount": bool(object_ref.get("coaster_mixer_train_mount", False)),
+    }
 
 
-def infer_selected_mount_layout(selected_empties, front_empty=None):
+def restore_attach_preview_object_state(snapshot):
+    if not snapshot:
+        return
+    object_ref = snapshot["object"]
+    if object_ref is None or bpy.data.objects.get(object_ref.name) is None:
+        return
+    follower_settings = object_ref.coaster_mixer_follower
+    assign_rna_property(follower_settings, "track_object", snapshot["track_object"])
+    assign_rna_property(follower_settings, "offset_meters", snapshot["offset_meters"])
+    assign_rna_property(follower_settings, "vertical_offset_meters", snapshot["vertical_offset_meters"])
+    assign_rna_property(follower_settings, "reverse_forward_axis", snapshot["reverse_forward_axis"])
+    assign_rna_property(follower_settings, "train_role", snapshot["train_role"])
+    assign_rna_property(follower_settings, "source_mount_object", snapshot["source_mount_object"])
+    object_ref.rotation_mode = snapshot["rotation_mode"]
+    object_ref.location = snapshot["location"]
+    object_ref.rotation_euler = snapshot["rotation_euler"]
+    if snapshot["batched_placement"]:
+        object_ref["coaster_mixer_batched_placement"] = True
+    else:
+        object_ref.pop("coaster_mixer_batched_placement", None)
+    mark_train_mount(object_ref, enabled=snapshot["train_mount"])
+
+
+def capture_attach_preview_state(context):
+    track_object, track_settings = resolve_active_track_settings(context)
+    if track_object is None or track_settings is None:
+        return None
+    selected_empties = [object_ref for object_ref in context.selected_objects if object_ref.type == "EMPTY"]
+    tracked_objects = list(selected_empties)
+    if track_settings.driven_empty_object is not None:
+        tracked_objects.append(track_settings.driven_empty_object)
+    unique_objects = []
+    seen = set()
+    for object_ref in tracked_objects:
+        if object_ref is None:
+            continue
+        object_key = object_ref.as_pointer()
+        if object_key in seen:
+            continue
+        seen.add(object_key)
+        unique_objects.append(object_ref)
+    return {
+        "track_object": track_object,
+        "driven_empty_object": track_settings.driven_empty_object,
+        "train_rig_mode": track_settings.train_rig_mode,
+        "train_mount_axis_preset": track_settings.train_mount_axis_preset,
+        "train_mounts_reversed": track_settings.train_mounts_reversed,
+        "objects": [capture_attach_preview_object_state(object_ref) for object_ref in unique_objects],
+    }
+
+
+def restore_attach_preview_state(snapshot):
+    if not snapshot:
+        return
+    track_object = snapshot["track_object"]
+    if track_object is None or bpy.data.objects.get(track_object.name) is None:
+        return
+    track_settings = track_object.coaster_mixer_track
+    assign_rna_property(track_settings, "driven_empty_object", snapshot["driven_empty_object"])
+    assign_rna_property(track_settings, "train_rig_mode", snapshot["train_rig_mode"])
+    assign_rna_property(track_settings, "train_mount_axis_preset", snapshot["train_mount_axis_preset"])
+    assign_rna_property(track_settings, "train_mounts_reversed", snapshot["train_mounts_reversed"])
+    for object_snapshot in snapshot["objects"]:
+        restore_attach_preview_object_state(object_snapshot)
+    place_track_followers(track_object)
+    refresh_view_layer()
+
+
+def apply_inferred_train_attach(track_object, track_settings, import_layout, reverse_facing=False, rig_mode="STANDARD"):
+    front_empty = import_layout.get("front_empty")
+    ordered_empties = import_layout.get("ordered_empties", [])
+    mount_lengths = import_layout.get("mount_lengths", [])
+    if track_object is None or track_settings is None or front_empty is None:
+        return 0.0
+    previous_front = track_settings.driven_empty_object
+    if previous_front is not None and previous_front != front_empty:
+        remove_follower_drivers(previous_front)
+    assign_rna_property(track_settings, "train_rig_mode", rig_mode)
+    assign_rna_property(track_settings, "train_mount_axis_preset", import_layout.get("axis_preset", "Y_FORWARD_Z_UP"))
+    assign_rna_property(track_settings, "train_mounts_reversed", reverse_facing)
+    assign_rna_property(track_settings, "driven_empty_object", front_empty)
+    ensure_follower_drivers(track_object, front_empty, offset_meters=0.0)
+    front_empty.coaster_mixer_follower.reverse_forward_axis = False
+    set_train_follower_role(front_empty, "IK_LEADER" if rig_mode == "IK_CHAIN" else "MOUNT")
+    mark_train_mount(front_empty, enabled=False)
+    running_offset = 0.0
+    for empty_object, length_meters in zip(ordered_empties, mount_lengths):
+        running_offset += length_meters
+        ensure_follower_drivers(track_object, empty_object, offset_meters=running_offset)
+        empty_object.coaster_mixer_follower.reverse_forward_axis = False
+        set_train_follower_role(empty_object, "IK_TARGET" if rig_mode == "IK_CHAIN" else "MOUNT")
+        mark_train_mount(empty_object)
+    place_track_followers(track_object)
+    refresh_view_layer()
+    return running_offset
+
+
+def get_selected_train_line_axis(empties):
+    if len(empties) < 2:
+        return Vector((1.0, 0.0, 0.0))
+    endpoint_a = empties[0]
+    endpoint_b = empties[1]
+    farthest_distance_squared = -1.0
+    for index, object_a in enumerate(empties[:-1]):
+        position_a = object_a.matrix_world.translation
+        for object_b in empties[index + 1:]:
+            delta = object_b.matrix_world.translation - position_a
+            distance_squared = delta.length_squared
+            if distance_squared > farthest_distance_squared:
+                farthest_distance_squared = distance_squared
+                endpoint_a = object_a
+                endpoint_b = object_b
+    axis = endpoint_b.matrix_world.translation - endpoint_a.matrix_world.translation
+    if axis.length <= 1.0e-8:
+        return Vector((1.0, 0.0, 0.0))
+    axis.normalize()
+    return axis
+
+
+def infer_empty_axis_preset(empties, line_axis):
+    world_up = Vector((0.0, 0.0, 1.0))
+    best_preset = "Y_FORWARD_Z_UP"
+    best_score = float("-inf")
+    best_forward_alignment = 0.0
+    for preset_identifier, _label, _description in TRAIN_MOUNT_AXIS_PRESET_ITEMS:
+        _right_axis, forward_axis, up_axis = get_train_mount_axis_basis(preset_identifier)
+        forward_alignment_total = 0.0
+        up_alignment_total = 0.0
+        for empty_object in empties:
+            rotation = empty_object.matrix_world.to_quaternion()
+            forward_alignment_total += (rotation @ forward_axis).dot(line_axis)
+            up_alignment_total += (rotation @ up_axis).dot(world_up)
+        count = max(len(empties), 1)
+        average_forward_alignment = forward_alignment_total / count
+        average_up_alignment = up_alignment_total / count
+        score = abs(average_forward_alignment) * 2.0 + average_up_alignment
+        if score > best_score:
+            best_score = score
+            best_preset = preset_identifier
+            best_forward_alignment = average_forward_alignment
+    return best_preset, best_forward_alignment
+
+
+def measure_empty_orientation_consistency(empties, axis_preset, line_axis):
+    if not empties:
+        return {"mismatch_count": 0, "worst_forward_alignment": 1.0, "worst_up_alignment": 1.0}
+    _right_axis, forward_axis, up_axis = get_train_mount_axis_basis(axis_preset)
+    mismatch_count = 0
+    worst_forward_alignment = 1.0
+    worst_up_alignment = 1.0
+    world_up = Vector((0.0, 0.0, 1.0))
+    for empty_object in empties:
+        rotation = empty_object.matrix_world.to_quaternion()
+        forward_alignment = abs((rotation @ forward_axis).dot(line_axis))
+        up_alignment = (rotation @ up_axis).dot(world_up)
+        worst_forward_alignment = min(worst_forward_alignment, forward_alignment)
+        worst_up_alignment = min(worst_up_alignment, up_alignment)
+        if forward_alignment < 0.75 or up_alignment < 0.25:
+            mismatch_count += 1
+    return {
+        "mismatch_count": mismatch_count,
+        "worst_forward_alignment": worst_forward_alignment,
+        "worst_up_alignment": worst_up_alignment,
+    }
+
+
+def infer_selected_mount_layout(selected_empties, flip_train=False):
     empties = [object_ref for object_ref in selected_empties if object_ref is not None and object_ref.type == "EMPTY"]
     if not empties:
-        return [], [], 0.0
-    front_empty = front_empty if front_empty in empties else empties[0]
-    trailing_empties = [object_ref for object_ref in empties if object_ref != front_empty]
-    if not trailing_empties:
-        return [], [], 0.0
+        return {"front_empty": None, "ordered_empties": [], "mount_lengths": [], "total_length": 0.0, "axis_preset": "Y_FORWARD_Z_UP"}
+    if len(empties) == 1:
+        return {
+            "front_empty": empties[0],
+            "ordered_empties": [],
+            "mount_lengths": [],
+            "total_length": 0.0,
+            "axis_preset": "Y_FORWARD_Z_UP",
+        }
 
-    if len(trailing_empties) == 1:
-        only_empty = trailing_empties[0]
-        gap = max((only_empty.matrix_world.translation - front_empty.matrix_world.translation).length, 0.01)
-        return [only_empty], [gap], gap
+    line_axis = get_selected_train_line_axis(empties)
+    axis_preset, average_forward_alignment = infer_empty_axis_preset(empties, line_axis)
+    sorted_empties = sorted(
+        empties,
+        key=lambda object_ref: (object_ref.matrix_world.translation.dot(line_axis), object_ref.name),
+    )
+    front_to_back = list(reversed(sorted_empties)) if average_forward_alignment >= 0.0 else list(sorted_empties)
+    if flip_train:
+        front_to_back.reverse()
 
-    farthest_object = None
-    farthest_distance_squared = -1.0
-    front_position = front_empty.matrix_world.translation
-    for object_ref in trailing_empties:
-        delta = object_ref.matrix_world.translation - front_position
-        distance_squared = delta.length_squared
-        if distance_squared > farthest_distance_squared:
-            farthest_distance_squared = distance_squared
-            farthest_object = object_ref
-
-    if farthest_object is None or farthest_distance_squared <= 1.0e-10:
-        ordered_empties = sorted(trailing_empties, key=lambda object_ref: object_ref.name)
-    else:
-        axis = farthest_object.matrix_world.translation - front_position
-        axis.normalize()
-        ordered_empties = sorted(
-            trailing_empties,
-            key=lambda object_ref: (object_ref.matrix_world.translation.dot(axis), object_ref.name),
-        )
-
+    front_empty = front_to_back[0]
+    ordered_empties = front_to_back[1:]
     gaps = []
     previous_object = front_empty
     for empty_object in ordered_empties:
@@ -1024,7 +1377,83 @@ def infer_selected_mount_layout(selected_empties, front_empty=None):
         previous_object = empty_object
 
     total_length = sum(gaps)
-    return ordered_empties, gaps, total_length
+    return {
+        "front_empty": front_empty,
+        "ordered_empties": ordered_empties,
+        "mount_lengths": gaps,
+        "total_length": total_length,
+        "axis_preset": axis_preset,
+    }
+
+
+def infer_selected_ik_chain_layout(context, selected_empties, flip_train=False):
+    empties = [object_ref for object_ref in selected_empties if object_ref is not None and object_ref.type == "EMPTY"]
+    active_object = getattr(context.view_layer.objects, "active", None)
+    if active_object is None or active_object.type != "EMPTY" or active_object not in empties:
+        active_object = empties[0] if empties else None
+    if active_object is None:
+        return {
+            "front_empty": None,
+            "leader_empty": None,
+            "ordered_empties": [],
+            "mount_lengths": [],
+            "total_length": 0.0,
+            "axis_preset": "Y_FORWARD_Z_UP",
+            "orientation_check": {"mismatch_count": 0, "worst_forward_alignment": 1.0, "worst_up_alignment": 1.0},
+        }
+
+    target_empties = [object_ref for object_ref in empties if object_ref != active_object]
+    if not target_empties:
+        return {
+            "front_empty": active_object,
+            "leader_empty": active_object,
+            "ordered_empties": [],
+            "mount_lengths": [],
+            "total_length": 0.0,
+            "axis_preset": "Y_FORWARD_Z_UP",
+            "orientation_check": {"mismatch_count": 0, "worst_forward_alignment": 1.0, "worst_up_alignment": 1.0},
+        }
+
+    line_axis = get_selected_train_line_axis(empties)
+    axis_preset, _average_forward_alignment = infer_empty_axis_preset(empties, line_axis)
+    leader_position = active_object.matrix_world.translation
+    ordered_targets = sorted(
+        target_empties,
+        key=lambda object_ref: (
+            (object_ref.matrix_world.translation - leader_position).dot(line_axis),
+            object_ref.name,
+        ),
+    )
+    if ordered_targets and (ordered_targets[0].matrix_world.translation - leader_position).dot(line_axis) < 0.0:
+        line_axis.negate()
+        ordered_targets = sorted(
+            target_empties,
+            key=lambda object_ref: (
+                (object_ref.matrix_world.translation - leader_position).dot(line_axis),
+                object_ref.name,
+            ),
+        )
+    orientation_check = measure_empty_orientation_consistency(empties, axis_preset, line_axis)
+    if flip_train:
+        ordered_targets = list(reversed(ordered_targets))
+
+    gaps = []
+    previous_object = active_object
+    for empty_object in ordered_targets:
+        gap = (empty_object.matrix_world.translation - previous_object.matrix_world.translation).length
+        gaps.append(max(gap, 0.01))
+        previous_object = empty_object
+
+    total_length = sum(gaps)
+    return {
+        "front_empty": active_object,
+        "leader_empty": active_object,
+        "ordered_empties": ordered_targets,
+        "mount_lengths": gaps,
+        "total_length": total_length,
+        "axis_preset": axis_preset,
+        "orientation_check": orientation_check,
+    }
 
 
 class COASTERMIXER_OT_edit_train_mount_length(bpy.types.Operator):
@@ -1224,6 +1653,7 @@ class COASTERMIXER_OT_create_train_followers(bpy.types.Operator):
             return {"CANCELLED"}
 
         ensure_train_front_empty(track_object, track_settings, context.collection)
+        assign_rna_property(track_settings, "train_rig_mode", "STANDARD")
         mounts = collect_track_followers(track_object)
         base_offset = get_train_mount_total_length_meters(mounts)
         for car_index in range(self.car_count):
@@ -1566,7 +1996,7 @@ class COASTERMIXER_OT_bake_simulation(bpy.types.Operator):
             scene.timeline_markers.remove(marker)
 
         for frame in range(frame_start, frame_end + 1):
-            mapped_index = resolve_trajectory_index(cache, max(frame - scene.frame_start, 0))
+            mapped_index = resolve_trajectory_index(cache, max(frame, 0))
             for channel, value in events_by_index.get(mapped_index, ()):
                 scene.timeline_markers.new(f"{marker_prefix}{channel}={value:g}", frame=frame)
 
@@ -1638,7 +2068,7 @@ def seed_default_station(context, track_object):
     settings.active_block_group_index = 0
     context.scene.coaster_mixer_scene.simulation_start_route_meters = 0.0
     block_group_update(settings, context)
-    context.scene.frame_set(context.scene.frame_start)
+    context.scene.frame_set(0)
     assign_simulation_enabled(context.scene.coaster_mixer_scene, True)
     return True
 

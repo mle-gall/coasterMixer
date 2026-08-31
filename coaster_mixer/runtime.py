@@ -4,7 +4,7 @@
 import bpy
 import gpu
 from bisect import bisect_left, bisect_right
-from math import atan2, log1p, pi, sin, tau
+from math import atan2, ceil, log1p, pi, sin, tau
 from time import perf_counter
 from mathutils import Matrix, Quaternion, Vector
 from mathutils.geometry import interpolate_bezier
@@ -20,6 +20,7 @@ PROPERTY_COMPARE_EPSILON = 1.0e-5
 SIMULATION_STOP_EPSILON = 1.0e-4
 GRAVITY_ACCELERATION = 9.81
 AIR_DENSITY_KG_M3 = 1.225
+BEZIER_SAMPLE_MAX_STEP_METERS = 0.25
 TRACK_LINE_COLOR = (0.22, 0.38, 0.52, 0.30)
 ACTIVE_ZONE_COLOR = (1.0, 0.62, 0.18, 0.95)
 TRANSPORT_ZONE_COLOR = (0.18, 0.78, 0.42, 0.95)
@@ -35,6 +36,10 @@ CONTROL_TRANSPORT_COLOR = (0.12, 0.55, 1.0, 0.95)
 CONTROL_BRAKE_COLOR = (1.0, 0.28, 0.08, 0.95)
 CONTROL_LOGIC_COLOR = (0.72, 0.42, 1.0, 0.95)
 CONTROL_POSITION_COLOR = (1.0, 1.0, 1.0, 1.0)
+FORCE_ZERO_COLOR = (0.10, 0.88, 0.48, 0.92)
+FORCE_MID_COLOR = (0.98, 0.86, 0.16, 0.94)
+FORCE_HIGH_COLOR = (0.98, 0.22, 0.10, 0.96)
+FORCE_NEGATIVE_COLOR = (0.12, 0.72, 1.0, 0.94)
 VIEWPORT_DRAW_HANDLER = None
 CONTROL_SELECTION_MSGBUS_OWNER = object()
 PROPERTY_SYNC_GUARD = False
@@ -61,7 +66,7 @@ OVERLAY_DRAW_CACHE_BY_OBJECT = {}
 OFFSET_ROUTE_CACHE_BY_KEY = {}
 TRAIN_MOUNT_SYNC_GUARD = False
 # Per-frame simulation trajectory (front/speed/stop time), deterministic in
-# the timeline: frame_start is t0, one 1/fps step per frame. Self-validating
+# the timeline: frame 0 is t0, one 1/fps step per frame. Self-validating
 # via its key (route key + physics scalars), so scrubbing and looping are
 # plain lookups.
 SIMULATION_TRAJECTORY_CACHE = None
@@ -115,6 +120,62 @@ ORIENTATION_FRAME_ITEMS = [
         "MINIMUM_TWIST",
         "Minimum Twist (Vertical Safe)",
         "Parallel-transport orientation along the curve without flipping when the track becomes vertical",
+    ),
+]
+TRAIN_MOUNT_PLACEMENT_MODE_ITEMS = [
+    (
+        "ARCLENGTH",
+        "Arc Length",
+        "Place each car mount at its authored route offset independently; simple and stable but compresses coupler distances over sharp crests and dips",
+    ),
+    (
+        "ARTICULATED",
+        "Articulated",
+        "Solve each trailing car mount sequentially so coupler distances stay rigid in world space along the mount path",
+    ),
+]
+TRAIN_RIG_MODE_ITEMS = [
+    (
+        "STANDARD",
+        "Standard Mounts",
+        "Generic train mounts or car anchors spaced along the route",
+    ),
+    (
+        "IK_CHAIN",
+        "IK Chain Train",
+        "Leader empty plus ordered IK target empties imported from an armature controller chain",
+    ),
+]
+TRAIN_MOUNT_AXIS_PRESET_ITEMS = [
+    (
+        "Y_FORWARD_Z_UP",
+        "Y Forward / Z Up",
+        "Default Coaster Mixer mount orientation: local +Y follows travel and local +Z points up",
+    ),
+    (
+        "Y_FORWARD_Z_DOWN",
+        "Y Forward / Z Down",
+        "Local +Y follows travel and local +Z points down",
+    ),
+    (
+        "Y_FORWARD_X_UP",
+        "Y Forward / X Up",
+        "Local +Y follows travel and local +X points up",
+    ),
+    (
+        "Y_FORWARD_X_DOWN",
+        "Y Forward / X Down",
+        "Local +Y follows travel and local +X points down",
+    ),
+    (
+        "X_FORWARD_Y_UP",
+        "X Forward / Y Up",
+        "Local +X follows travel and local +Y points up",
+    ),
+    (
+        "X_FORWARD_Y_DOWN",
+        "X Forward / Y Down",
+        "Local +X follows travel and local +Y points down",
     ),
 ]
 CONTROL_RESPONSE_CURVE_ITEMS = [
@@ -338,7 +399,6 @@ def build_curve_world_points(track_object):
             return [matrix_world @ bezier_points[0].co], [bezier_points[0].tilt]
 
         segment_count = count if spline.use_cyclic_u else count - 1
-        resolution = max(int(spline.resolution_u) * 2, 16)
         control_tilts = unwrap_tilt_values(
             [point.tilt for point in bezier_points],
             cyclic=spline.use_cyclic_u,
@@ -351,6 +411,16 @@ def build_curve_world_points(track_object):
             point_b = bezier_points[(index + 1) % count]
             tilt_a = control_tilts[index]
             tilt_b = control_tilts[index + 1]
+            control_length = (
+                (point_a.handle_right - point_a.co).length
+                + (point_b.handle_left - point_a.handle_right).length
+                + (point_b.co - point_b.handle_left).length
+            )
+            resolution = max(
+                int(spline.resolution_u) * 2,
+                int(ceil(control_length / BEZIER_SAMPLE_MAX_STEP_METERS)),
+                16,
+            )
             segment_points = interpolate_bezier(
                 point_a.co,
                 point_a.handle_right,
@@ -1464,7 +1534,7 @@ def coaster_mixer_trigger_driver(channel):
         if not channel_data:
             return 0.0
 
-        index = resolve_trajectory_index(cache, max(int(frame) - scene.frame_start, 0))
+        index = resolve_trajectory_index(cache, max(int(frame), 0))
         frames, values = channel_data
         position = bisect_right(frames, index)
         if position == 0:
@@ -1543,6 +1613,12 @@ def draw_points(points, color, size):
     shader.uniform_float("color", color)
     batch.draw(shader)
     gpu.state.point_size_set(1.0)
+
+
+def draw_line_segment(start_point, end_point, color, width):
+    if start_point is None or end_point is None:
+        return
+    draw_polyline([start_point, end_point], color, width)
 
 
 def clamp_zone_span(track_object, zone):
@@ -1740,7 +1816,17 @@ def get_overlay_route_signature(route, scene):
 
     scene_settings = getattr(scene, "coaster_mixer_scene", None)
     start_meters = round(scene_settings.simulation_start_route_meters, 4) if scene_settings else 0.0
-    return (program_signature, sensor_signature, trajectory_signature, start_meters)
+    force_signature = None
+    if scene_settings is not None:
+        force_signature = (
+            bool(scene_settings.show_force_overlays),
+            bool(scene_settings.show_vertical_force_overlays),
+            bool(scene_settings.show_lateral_force_overlays),
+            round(scene_settings.force_overlay_step_meters, 4),
+            round(scene_settings.force_overlay_scale_meters, 4),
+            round(scene_settings.force_overlay_max_g, 4),
+        )
+    return (program_signature, sensor_signature, trajectory_signature, start_meters, force_signature)
 
 
 def get_overlay_draw_cache_signature(route, edit_piece, edit_settings, scene, control_selection=None):
@@ -1851,7 +1937,143 @@ def build_friction_slowdown_polylines(route, route_zones):
     return polylines
 
 
-def build_overlay_draw_data(route, edit_piece, edit_settings, scene, control_selection=None):
+def lerp_color(color_a, color_b, factor):
+    factor = clamp(factor, 0.0, 1.0)
+    return tuple(color_a[index] + (color_b[index] - color_a[index]) * factor for index in range(4))
+
+
+def get_signed_force_overlay_color(force_g, max_g):
+    normalized = clamp(abs(force_g) / max(max_g, 1.0e-6), 0.0, 1.0)
+    if force_g < 0.0:
+        return lerp_color(FORCE_ZERO_COLOR, FORCE_NEGATIVE_COLOR, normalized)
+    if normalized < 0.5:
+        return lerp_color(FORCE_ZERO_COLOR, FORCE_MID_COLOR, normalized * 2.0)
+    return lerp_color(FORCE_MID_COLOR, FORCE_HIGH_COLOR, (normalized - 0.5) * 2.0)
+
+
+def get_route_speed_profile_samples(scene, track_object, track_settings, route):
+    cache, _resolved_route = get_simulation_trajectory_cache(scene, track_object, track_settings)
+    if cache is None:
+        return []
+
+    if route["cyclic"]:
+        if cache["cycle_length"] is None:
+            sample_simulation_trajectory(scene, track_object, track_settings, TRAJECTORY_FRAME_LIMIT)
+        cycle_start = cache.get("cycle_start")
+        cycle_length = cache.get("cycle_length")
+        if cycle_start is None or cycle_length is None or cycle_length <= 0:
+            return []
+        start_index = cycle_start
+        end_index = min(cycle_start + cycle_length, len(cache["fronts"]))
+    else:
+        end_index = 1
+        total_length = route["total_length"]
+        while end_index < TRAJECTORY_FRAME_LIMIT:
+            sample = sample_simulation_trajectory(scene, track_object, track_settings, end_index)
+            if sample is None:
+                break
+            end_index += 1
+            if sample[0] >= total_length - SIMULATION_STOP_EPSILON and sample[1] >= -SIMULATION_STOP_EPSILON:
+                break
+        start_index = 0
+        end_index = min(end_index, len(cache["fronts"]))
+
+    samples = []
+    total_length = route["total_length"]
+    for index in range(start_index, end_index):
+        wrapped_front = wrap_route_distance(route, cache["fronts"][index]) if route["cyclic"] else clamp(cache["fronts"][index], 0.0, total_length)
+        samples.append((wrapped_front, cache["speeds"][index]))
+    samples.sort(key=lambda item: item[0])
+    deduped_samples = []
+    for distance, speed in samples:
+        if deduped_samples and abs(deduped_samples[-1][0] - distance) <= 1.0e-6:
+            previous_distance, previous_speed = deduped_samples[-1]
+            deduped_samples[-1] = (previous_distance, max(previous_speed, speed))
+        else:
+            deduped_samples.append((distance, speed))
+    return deduped_samples
+
+
+def sample_route_speed_profile(profile_samples, route, distance, fallback_speed):
+    if not profile_samples:
+        return max(fallback_speed, 0.0)
+    distances = [item[0] for item in profile_samples]
+    wrapped_distance = wrap_route_distance(route, distance) if route["cyclic"] else clamp(distance, 0.0, route["total_length"])
+    insert_index = bisect_left(distances, wrapped_distance)
+    if insert_index <= 0:
+        if route["cyclic"] and len(profile_samples) > 1:
+            left_distance, left_speed = profile_samples[-1]
+            right_distance, right_speed = profile_samples[0]
+            span = (route["total_length"] - left_distance) + right_distance
+            offset = (route["total_length"] - left_distance) + wrapped_distance
+            factor = clamp(offset / max(span, 1.0e-6), 0.0, 1.0)
+            return left_speed + (right_speed - left_speed) * factor
+        return profile_samples[0][1]
+    if insert_index >= len(profile_samples):
+        return profile_samples[-1][1]
+    left_distance, left_speed = profile_samples[insert_index - 1]
+    right_distance, right_speed = profile_samples[insert_index]
+    span = max(right_distance - left_distance, 1.0e-6)
+    factor = clamp((wrapped_distance - left_distance) / span, 0.0, 1.0)
+    return left_speed + (right_speed - left_speed) * factor
+
+
+def build_force_overlay_segments(scene, track_object, track_settings, route):
+    scene_settings = getattr(scene, "coaster_mixer_scene", None)
+    if (
+        scene_settings is None
+        or not scene_settings.show_force_overlays
+        or route["total_length"] <= 1.0e-6
+        or (not scene_settings.show_vertical_force_overlays and not scene_settings.show_lateral_force_overlays)
+    ):
+        return [], []
+
+    step_meters = clamp(scene_settings.force_overlay_step_meters, 0.05, max(route["total_length"], 0.05))
+    scale_meters = max(scene_settings.force_overlay_scale_meters, 0.01)
+    max_g = max(scene_settings.force_overlay_max_g, 0.25)
+    fallback_speed = max(getattr(scene_settings, "simulation_current_speed_mps", 0.0), 0.0)
+    profile_samples = get_route_speed_profile_samples(scene, track_object, track_settings, route)
+
+    vertical_segments = []
+    lateral_segments = []
+    sample_count = max(int(ceil(route["total_length"] / step_meters)), 1)
+    for sample_index in range(sample_count + 1):
+        distance = min(sample_index * step_meters, route["total_length"])
+        location, rotation = sample_route_placement(route, distance)
+        if location is None or rotation is None:
+            continue
+        speed_mps = sample_route_speed_profile(profile_samples, route, distance, fallback_speed)
+        metrics = get_simulation_overlay_metrics(scene, track_object, track_settings, route, distance, speed_mps)
+        if metrics is None:
+            continue
+        local_side = rotation @ Vector((1.0, 0.0, 0.0))
+        local_up = rotation @ Vector((0.0, 0.0, 1.0))
+        base_point = location
+
+        if scene_settings.show_vertical_force_overlays:
+            vertical_force_g = metrics["vertical_g_signed"]
+            vertical_length = clamp(vertical_force_g, -max_g, max_g) * scale_meters
+            if abs(vertical_length) > 1.0e-5:
+                vertical_segments.append((
+                    base_point,
+                    base_point + local_up * vertical_length,
+                    get_signed_force_overlay_color(vertical_force_g, max_g),
+                ))
+
+        if scene_settings.show_lateral_force_overlays:
+            lateral_force_g = metrics["lateral_g_signed"]
+            lateral_length = clamp(lateral_force_g, -max_g, max_g) * scale_meters
+            if abs(lateral_length) > 1.0e-5:
+                lateral_segments.append((
+                    base_point,
+                    base_point + local_side * lateral_length,
+                    get_signed_force_overlay_color(lateral_force_g, max_g),
+                ))
+
+    return vertical_segments, lateral_segments
+
+
+def build_overlay_draw_data(route, track_object, track_settings, edit_piece, edit_settings, scene, control_selection=None):
     route_polylines = [entry["cache"]["points"] for entry in route["entries"]]
     if all(entry["object"] != edit_piece for entry in route["entries"]):
         # The edited piece is not on the active route (e.g. a storage track
@@ -1875,6 +2097,8 @@ def build_overlay_draw_data(route, edit_piece, edit_settings, scene, control_sel
         "control_logic_polylines": [],
         "control_position_points": [],
         "control_hold_points": [],
+        "vertical_force_segments": [],
+        "lateral_force_segments": [],
     }
 
     # Route-level indicators: block spans + move points, sensors, friction
@@ -1945,6 +2169,10 @@ def build_overlay_draw_data(route, edit_piece, edit_settings, scene, control_sel
                         draw_data["control_position_points"].append(location)
 
     if len(edit_settings.zones) == 0:
+        (
+            draw_data["vertical_force_segments"],
+            draw_data["lateral_force_segments"],
+        ) = build_force_overlay_segments(scene, track_object, track_settings, route)
         return draw_data
 
     active_index = get_clamped_active_zone_index(edit_settings)
@@ -1965,6 +2193,10 @@ def build_overlay_draw_data(route, edit_piece, edit_settings, scene, control_sel
             end_location, _tangent, _cache = sample_curve_cache_at_distance(cache, end_distance)
             draw_data["seam_points"] = [point for point in (start_location, end_location) if point is not None]
 
+    (
+        draw_data["vertical_force_segments"],
+        draw_data["lateral_force_segments"],
+    ) = build_force_overlay_segments(scene, track_object, track_settings, route)
     return draw_data
 
 
@@ -1986,7 +2218,7 @@ def get_overlay_draw_data(track_object, edit_piece, edit_settings, scene):
     if cached_entry is not None and cached_entry["signature"] == signature:
         return cached_entry["draw_data"]
 
-    draw_data = build_overlay_draw_data(route, edit_piece, edit_settings, scene, control_selection)
+    draw_data = build_overlay_draw_data(route, track_object, track_object.coaster_mixer_track, edit_piece, edit_settings, scene, control_selection)
     OVERLAY_DRAW_CACHE_BY_OBJECT[object_key] = {
         "signature": signature,
         "draw_data": draw_data,
@@ -2041,6 +2273,11 @@ def draw_viewport_overlay():
             draw_polyline(polyline, CONTROL_BRAKE_COLOR, 18.0)
         draw_points(draw_data["control_position_points"], CONTROL_POSITION_COLOR, 20.0)
         draw_points(draw_data["control_hold_points"], CONTROL_BRAKE_COLOR, 22.0)
+    if scene_settings is not None and scene_settings.show_force_overlays:
+        for start_point, end_point, color in draw_data["vertical_force_segments"]:
+            draw_line_segment(start_point, end_point, color, 2.0)
+        for start_point, end_point, color in draw_data["lateral_force_segments"]:
+            draw_line_segment(start_point, end_point, color, 2.0)
     draw_polyline(draw_data["active_points"], ACTIVE_ZONE_COLOR, 12.0)
     for line in draw_data["start_arrow_lines"]:
         draw_polyline(line, START_MARKER_COLOR, 4.0)
@@ -2386,6 +2623,12 @@ def mark_train_mount(empty_object, enabled=True):
     empty_object.pop("coaster_mixer_bound_child_name", None)
 
 
+def set_train_follower_role(empty_object, role="MOUNT"):
+    if empty_object is None or empty_object.type != "EMPTY":
+        return
+    assign_rna_property(empty_object.coaster_mixer_follower, "train_role", role)
+
+
 def get_train_mount_payload_children(empty_object):
     return [
         child
@@ -2589,9 +2832,84 @@ def get_track_placement_local_offset(track_object, follower_object):
     return Vector((0.0, 0.0, follower_object.coaster_mixer_follower.vertical_offset_meters))
 
 
+def get_wheelcarrier_relative_local_offset(track_object, follower_object):
+    if (
+        track_object is None
+        or follower_object is None
+        or not follower_object.get("coaster_mixer_wheelcarrier_helper", False)
+    ):
+        return Vector((0.0, 0.0, 0.0))
+    track_settings = track_object.coaster_mixer_track
+    side_identifier = follower_object.get("coaster_mixer_wheelcarrier_side", "L")
+    lateral_sign = 1.0 if side_identifier == "L" else -1.0
+    source_mount_object = get_track_placement_source_mount(track_object, follower_object)
+    helper_offset = Vector(
+        (
+            track_settings.wheelcarrier_lateral_offset_meters * lateral_sign,
+            track_settings.wheelcarrier_longitudinal_offset_meters,
+            track_settings.wheelcarrier_vertical_offset_meters,
+        )
+    )
+    return rotate_local_offset_for_mount_axes(source_mount_object, helper_offset)
+
+
+def get_train_mount_axis_correction(track_settings):
+    right_axis, forward_axis, up_axis = get_train_mount_axis_basis(
+        getattr(track_settings, "train_mount_axis_preset", "Y_FORWARD_Z_UP")
+        if track_settings is not None
+        else "Y_FORWARD_Z_UP"
+    )
+    return Matrix((right_axis, forward_axis, up_axis)).transposed().to_quaternion()
+
+
+def get_train_mount_axis_basis(preset):
+    basis_by_preset = {
+        "Y_FORWARD_Z_UP": (
+            Vector((1.0, 0.0, 0.0)),
+            Vector((0.0, 1.0, 0.0)),
+            Vector((0.0, 0.0, 1.0)),
+        ),
+        "Y_FORWARD_Z_DOWN": (
+            Vector((-1.0, 0.0, 0.0)),
+            Vector((0.0, 1.0, 0.0)),
+            Vector((0.0, 0.0, -1.0)),
+        ),
+        "Y_FORWARD_X_UP": (
+            Vector((0.0, 0.0, 1.0)),
+            Vector((0.0, 1.0, 0.0)),
+            Vector((-1.0, 0.0, 0.0)),
+        ),
+        "Y_FORWARD_X_DOWN": (
+            Vector((0.0, 0.0, -1.0)),
+            Vector((0.0, 1.0, 0.0)),
+            Vector((1.0, 0.0, 0.0)),
+        ),
+        "X_FORWARD_Y_UP": (
+            Vector((0.0, 0.0, -1.0)),
+            Vector((1.0, 0.0, 0.0)),
+            Vector((0.0, 1.0, 0.0)),
+        ),
+        "X_FORWARD_Y_DOWN": (
+            Vector((0.0, 0.0, 1.0)),
+            Vector((1.0, 0.0, 0.0)),
+            Vector((0.0, -1.0, 0.0)),
+        ),
+    }
+    return basis_by_preset.get(
+        preset,
+        basis_by_preset["Y_FORWARD_Z_UP"],
+    )
+
+
 def get_track_placement_rotation(follower_object, base_rotation, track_object=None):
     if follower_object is None or base_rotation is None:
         return base_rotation
+    axis_correction = Quaternion()
+    global_reverse = False
+    if track_object is not None and track_object.type == "CURVE":
+        track_settings = track_object.coaster_mixer_track
+        axis_correction = get_train_mount_axis_correction(track_settings)
+        global_reverse = bool(getattr(track_settings, "train_mounts_reversed", False))
     reverse_forward_axis = follower_object.coaster_mixer_follower.reverse_forward_axis
     if (
         track_object is not None
@@ -2600,9 +2918,10 @@ def get_track_placement_rotation(follower_object, base_rotation, track_object=No
         source_mount_object = get_track_placement_source_mount(track_object, follower_object)
         if source_mount_object is not None:
             reverse_forward_axis = source_mount_object.coaster_mixer_follower.reverse_forward_axis
-    if reverse_forward_axis:
-        return base_rotation @ Quaternion((0.0, 0.0, 1.0), pi)
-    return base_rotation
+    rotation = base_rotation @ axis_correction
+    if bool(reverse_forward_axis) != global_reverse:
+        return rotation @ Quaternion((0.0, 0.0, 1.0), pi)
+    return rotation
 
 
 def sample_route_offset_placement(route, front_meters, offset_meters, local_offset):
@@ -2627,6 +2946,166 @@ def sample_route_offset_placement(route, front_meters, offset_meters, local_offs
     if location is None or rotation is None:
         return None
     return location, rotation, distance
+
+
+def sample_mount_path_placement(route, route_distance, local_offset):
+    location, rotation = sample_route_placement(route, route_distance)
+    if location is None or rotation is None:
+        return None, None, wrap_route_distance(route, route_distance)
+    local_offset = Vector(local_offset)
+    return location + rotation @ local_offset, rotation, wrap_route_distance(route, route_distance)
+
+
+def solve_trailing_mount_route_distance(route, local_offset, lead_route_distance, coupler_length):
+    coupler_length = max(coupler_length, 0.0)
+    if coupler_length <= 1.0e-8:
+        return lead_route_distance
+
+    lead_point, _lead_rotation, wrapped_lead_route_distance = sample_mount_path_placement(
+        route,
+        lead_route_distance,
+        local_offset,
+    )
+    if lead_point is None:
+        return lead_route_distance
+
+    trailing_limit = (
+        lead_route_distance - route["total_length"]
+        if route["cyclic"] and route["total_length"] > 1.0e-8
+        else 0.0
+    )
+    high_distance = lead_route_distance
+    low_distance = max(lead_route_distance - coupler_length, trailing_limit)
+    low_point, _low_rotation, _wrapped_low_distance = sample_mount_path_placement(
+        route,
+        low_distance,
+        local_offset,
+    )
+    low_chord = (lead_point - low_point).length if low_point is not None else 0.0
+
+    search_step = max(coupler_length * 0.5, 0.05)
+    while low_distance > trailing_limit + 1.0e-8 and low_chord < coupler_length - 1.0e-5:
+        next_low_distance = max(low_distance - search_step, trailing_limit)
+        if abs(next_low_distance - low_distance) <= 1.0e-8:
+            break
+        low_distance = next_low_distance
+        low_point, _low_rotation, _wrapped_low_distance = sample_mount_path_placement(
+            route,
+            low_distance,
+            local_offset,
+        )
+        low_chord = (lead_point - low_point).length if low_point is not None else 0.0
+        search_step *= 1.5
+
+    if low_chord < coupler_length - 1.0e-5:
+        return low_distance
+
+    for _iteration in range(18):
+        mid_distance = 0.5 * (low_distance + high_distance)
+        mid_point, _mid_rotation, _wrapped_mid_distance = sample_mount_path_placement(
+            route,
+            mid_distance,
+            local_offset,
+        )
+        mid_chord = (lead_point - mid_point).length if mid_point is not None else 0.0
+        if mid_chord >= coupler_length:
+            low_distance = mid_distance
+        else:
+            high_distance = mid_distance
+    if route["cyclic"]:
+        return wrap_route_distance(route, low_distance)
+    return clamp(low_distance, 0.0, wrapped_lead_route_distance)
+
+
+def get_main_mount_placement_mode(track_settings):
+    if track_settings is None:
+        return "ARCLENGTH"
+    return getattr(track_settings, "train_mount_placement_mode", "ARCLENGTH")
+
+
+def solve_main_train_mount_placements(track_object, route, front_meters):
+    mounts = collect_main_train_mounts(track_object)
+    if not mounts:
+        return {}
+
+    track_settings = track_object.coaster_mixer_track
+    local_offset = Vector((0.0, 0.0, track_settings.train_mount_vertical_offset_meters))
+    use_articulated_mode = get_main_mount_placement_mode(track_settings) == "ARTICULATED"
+    placements = {}
+
+    lead_sample = sample_route_offset_placement(route, front_meters, 0.0, local_offset)
+    if lead_sample is None:
+        return placements
+
+    lead_rotation = lead_sample[1]
+    if local_offset.length > 1.0e-8:
+        centerline_location, centerline_rotation = sample_route_placement(route, lead_sample[2])
+        if centerline_location is not None and centerline_rotation is not None:
+            lead_rotation = centerline_rotation
+    placements[mounts[0].as_pointer()] = (
+        lead_sample[0],
+        get_track_placement_rotation(mounts[0], lead_rotation, track_object=track_object),
+        lead_sample[2],
+    )
+
+    if not use_articulated_mode:
+        for mount_object in mounts[1:]:
+            sample = sample_route_offset_placement(
+                route,
+                front_meters,
+                mount_object.coaster_mixer_follower.offset_meters,
+                local_offset,
+            )
+            if sample is None:
+                continue
+            sample_rotation = sample[1]
+            if local_offset.length > 1.0e-8:
+                centerline_location, centerline_rotation = sample_route_placement(route, sample[2])
+                if centerline_location is not None and centerline_rotation is not None:
+                    sample_rotation = centerline_rotation
+            placements[mount_object.as_pointer()] = (
+                sample[0],
+                get_track_placement_rotation(mount_object, sample_rotation, track_object=track_object),
+                sample[2],
+            )
+        return placements
+
+    previous_mount = mounts[0]
+    previous_route_distance = lead_sample[2]
+    for mount_object in mounts[1:]:
+        coupler_length = max(
+            mount_object.coaster_mixer_follower.offset_meters
+            - previous_mount.coaster_mixer_follower.offset_meters,
+            0.0,
+        )
+        solved_route_distance = solve_trailing_mount_route_distance(
+            route,
+            local_offset,
+            previous_route_distance,
+            coupler_length,
+        )
+        location, _offset_rotation, route_distance = sample_mount_path_placement(
+            route,
+            solved_route_distance,
+            local_offset,
+        )
+        if location is None:
+            previous_mount = mount_object
+            previous_route_distance = solved_route_distance
+            continue
+        _centerline_location, centerline_rotation = sample_route_placement(route, route_distance)
+        if centerline_rotation is None:
+            previous_mount = mount_object
+            previous_route_distance = solved_route_distance
+            continue
+        placements[mount_object.as_pointer()] = (
+            location,
+            get_track_placement_rotation(mount_object, centerline_rotation, track_object=track_object),
+            route_distance,
+        )
+        previous_mount = mount_object
+        previous_route_distance = solved_route_distance
+    return placements
 
 
 def should_use_offset_rotation(track_object, follower_object):
@@ -2885,8 +3364,8 @@ def place_ride_cameras(track_object, placement_by_object, route, front_meters):
         # roll. Keep it only as a durable target reference; orientation is
         # solved here from target position + the mounted car's banked up axis.
         aim_constraint.influence = 0.0
-        mount_location, mount_rotation = mount_sample
-        target_location, _target_rotation = target_sample
+        mount_location, mount_rotation, mount_distance = mount_sample
+        target_location, _target_rotation, _target_distance = target_sample
         camera_settings = getattr(camera_object, "coaster_mixer_camera", None)
         shake_state = None
         camera_location = mount_location.copy()
@@ -2897,11 +3376,10 @@ def place_ride_cameras(track_object, placement_by_object, route, front_meters):
                 Vector(camera_settings.offset_xyz),
             )
             local_camera_offset.z += track_object.coaster_mixer_track.train_mount_vertical_offset_meters
-            mount_offset_meters = get_track_placement_offset_meters(track_object, camera_settings.mount_object)
             camera_sample = sample_route_offset_placement(
                 route,
-                front_meters,
-                mount_offset_meters,
+                mount_distance,
+                0.0,
                 local_camera_offset,
             )
             shake_state = get_camera_shake_state(
@@ -2953,11 +3431,47 @@ def place_track_followers(track_object, front_meters=None):
 
     samples_by_offset = {}
     placement_by_object = {}
+    placement_by_object.update(solve_main_train_mount_placements(track_object, route, front_meters))
     for follower_object in collect_track_placement_objects(track_object):
         # Lazily migrate followers from files saved with the driver-based rig.
         if not follower_object.get("coaster_mixer_batched_placement", False):
             remove_placement_channel_drivers(follower_object)
             follower_object["coaster_mixer_batched_placement"] = True
+        existing_placement = placement_by_object.get(follower_object.as_pointer())
+        if existing_placement is not None:
+            if follower_object.rotation_mode != "XYZ":
+                follower_object.rotation_mode = "XYZ"
+            follower_object.location = existing_placement[0]
+            follower_object.rotation_euler = existing_placement[1].to_euler("XYZ")
+            continue
+        source_mount_object = get_track_placement_source_mount(track_object, follower_object)
+        if (
+            follower_object.get("coaster_mixer_wheelcarrier_helper", False)
+            and source_mount_object is not None
+            and source_mount_object != follower_object
+            and source_mount_object.as_pointer() in placement_by_object
+        ):
+            source_location, _source_rotation, source_distance = placement_by_object[source_mount_object.as_pointer()]
+            _source_centerline_location, source_base_rotation = sample_route_placement(route, source_distance)
+            if source_base_rotation is None:
+                continue
+            local_offset = get_wheelcarrier_relative_local_offset(track_object, follower_object)
+            object_rotation = get_track_placement_rotation(
+                follower_object,
+                source_base_rotation,
+                track_object=track_object,
+            )
+            follower_location = source_location + source_base_rotation @ local_offset
+            if follower_object.rotation_mode != "XYZ":
+                follower_object.rotation_mode = "XYZ"
+            follower_object.location = follower_location
+            follower_object.rotation_euler = object_rotation.to_euler("XYZ")
+            placement_by_object[follower_object.as_pointer()] = (
+                follower_location,
+                object_rotation,
+                source_distance,
+            )
+            continue
         offset = get_track_placement_offset_meters(track_object, follower_object)
         local_offset = get_track_placement_local_offset(track_object, follower_object)
         cache_key = (round(offset, 5), *to_local_offset_tuple(local_offset))
@@ -2981,7 +3495,11 @@ def place_track_followers(track_object, front_meters=None):
         follower_location = sample[0]
         follower_object.location = follower_location
         follower_object.rotation_euler = object_rotation.to_euler("XYZ")
-        placement_by_object[follower_object.as_pointer()] = (follower_location, object_rotation)
+        placement_by_object[follower_object.as_pointer()] = (
+            follower_location,
+            object_rotation,
+            sample[2],
+        )
     place_ride_cameras(track_object, placement_by_object, route, front_meters)
 
 
@@ -3610,7 +4128,6 @@ def get_trajectory_key(scene, track_object, track_settings, route):
         track_object.as_pointer(),
         route["key"],
         round(get_scene_fps(scene), 6),
-        scene.frame_start,
         round(scene_settings.simulation_start_route_meters, 6),
         round(track_settings.train_length_meters, 6),
         round(track_settings.train_weight_kilograms, 6),
@@ -3676,7 +4193,7 @@ def resolve_trajectory_index(cache, index):
 def sample_simulation_trajectory(scene, track_object, track_settings, frame):
     """Deterministic (front, speed, stop_remaining) for a timeline frame.
 
-    frame_start is simulation time zero; each frame advances one 1/fps step.
+    Frame 0 is simulation time zero; each frame advances one 1/fps step.
     Frames are memoized, and once the quantized state recurs the trajectory
     loops, so scrubbing in either direction and playing past the cycle end
     are O(1) lookups.
@@ -3685,7 +4202,7 @@ def sample_simulation_trajectory(scene, track_object, track_settings, frame):
     if cache is None:
         return None
 
-    index = resolve_trajectory_index(cache, max(int(frame) - scene.frame_start, 0))
+    index = resolve_trajectory_index(cache, max(int(frame), 0))
     fronts = cache["fronts"]
 
     if index >= len(fronts) and cache["cycle_length"] is None:

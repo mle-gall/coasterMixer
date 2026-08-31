@@ -83,6 +83,7 @@ CLASSES = (
     COASTERMIXER_OT_snap_start_to_station,
     COASTERMIXER_OT_setup_driven_empty,
     COASTERMIXER_OT_attach_selected_followers,
+    COASTERMIXER_OT_attach_selected_ik_chain,
     COASTERMIXER_OT_edit_train_mount_length,
     COASTERMIXER_OT_create_train_followers,
     COASTERMIXER_OT_create_train_camera,
