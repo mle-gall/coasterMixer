@@ -745,8 +745,8 @@ class COASTERMIXER_OT_snap_start_to_station(bpy.types.Operator):
 
 class COASTERMIXER_OT_setup_driven_empty(bpy.types.Operator):
     bl_idname = "coaster_mixer.setup_driven_empty"
-    bl_label = "Attach Driven Empty"
-    bl_description = "Place the driven empty with arc-length placement drivers (location and banked rotation) at the train front"
+    bl_label = "Attach Train Front Empty"
+    bl_description = "Place the train front empty with arc-length placement at the train front"
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
@@ -768,17 +768,76 @@ class COASTERMIXER_OT_setup_driven_empty(bpy.types.Operator):
 
 class COASTERMIXER_OT_attach_selected_followers(bpy.types.Operator):
     bl_idname = "coaster_mixer.attach_selected_followers"
-    bl_label = "Attach Selected"
-    bl_description = "Attach the selected empties to the active track as follower empties with placement drivers"
+    bl_label = "Attach Selected Empties"
+    bl_description = "Attach the selected empties to the active track as train car mounts, preserving their current spacing"
     bl_options = {"REGISTER", "UNDO"}
+
+    reverse_facing: bpy.props.BoolProperty(
+        name="Face Backward",
+        description="Flip the selected empties 180 degrees around their local up axis when attaching",
+        default=False,
+    )
+    adjust_train_length: bpy.props.BoolProperty(
+        name="Set Train Length",
+        description="Update the physical train length to match the resulting full mount layout",
+        default=True,
+    )
+    adjust_station_length: bpy.props.BoolProperty(
+        name="Resize Station to Train",
+        description="Match the seam Station to the resulting train length by moving its entry backward while keeping its exit at the coaster start",
+        default=True,
+    )
 
     @classmethod
     def poll(cls, context):
         track_object, _track_settings = resolve_active_track_settings(context)
         return track_object is not None
 
-    def execute(self, context):
+    def invoke(self, context, _event):
+        return context.window_manager.invoke_props_dialog(self, width=420)
+
+    def draw(self, context):
+        layout = self.layout
         track_object, _track_settings = resolve_active_track_settings(context)
+        selected_empties = [object_ref for object_ref in context.selected_objects if object_ref.type == "EMPTY"]
+        front_empty = get_selected_train_front_empty(context, selected_empties)
+        ordered_empties, mount_lengths, added_length = infer_selected_mount_layout(selected_empties, front_empty)
+
+        mounts = collect_track_followers(track_object) if track_object is not None else []
+        current_total_length = get_train_mount_total_length_meters(mounts)
+        proposed_total_length = current_total_length + added_length
+
+        column = layout.column()
+        column.use_property_split = True
+        column.use_property_decorate = False
+        column.prop(self, "reverse_facing")
+
+        summary = layout.box()
+        summary.label(text=f"Selected empties: {len(ordered_empties)}", icon="OUTLINER_OB_EMPTY")
+        if front_empty is not None:
+            summary.label(text=f"Front empty: {front_empty.name}", icon="EMPTY_AXIS")
+        if mount_lengths:
+            summary.label(text="Imported lengths: " + ", ".join(f"{length:.2f} m" for length in mount_lengths[:6]))
+            if len(mount_lengths) > 6:
+                summary.label(text=f"... and {len(mount_lengths) - 6} more")
+        summary.label(text=f"Train length: {current_total_length:.2f} m -> {proposed_total_length:.2f} m", icon="DRIVER_DISTANCE")
+        summary.prop(self, "adjust_train_length")
+
+        station = get_adjustable_seam_station(track_object) if track_object is not None else None
+        station_column = summary.column()
+        station_column.enabled = station is not None
+        station_column.prop(self, "adjust_station_length")
+        if station is not None:
+            station_length = min(proposed_total_length, station["maximum_length"])
+            station_column.label(text=f"Station: {station['current_length']:.2f} m -> {station_length:.2f} m")
+            station_column.label(text="Exit stays at coaster start; entry moves backward.", icon="INFO")
+            if proposed_total_length > station["maximum_length"] + 1.0e-3:
+                station_column.label(text="Limited by the final track piece length.", icon="ERROR")
+        else:
+            summary.label(text="No adjustable Station ending at the coaster start.", icon="INFO")
+
+    def execute(self, context):
+        track_object, track_settings = resolve_active_track_settings(context)
         selected_empties = [
             object_ref
             for object_ref in context.selected_objects
@@ -788,12 +847,44 @@ class COASTERMIXER_OT_attach_selected_followers(bpy.types.Operator):
             self.report({"WARNING"}, "Select one or more empty objects first")
             return {"CANCELLED"}
 
-        for empty_object in selected_empties:
-            ensure_follower_drivers(track_object, empty_object)
+        front_empty = get_selected_train_front_empty(context, selected_empties)
+        if front_empty is None:
+            self.report({"WARNING"}, "Select an active empty to use as the train front")
+            return {"CANCELLED"}
+        ordered_empties, mount_lengths, _added_length = infer_selected_mount_layout(selected_empties, front_empty)
+
+        previous_front = track_settings.driven_empty_object
+        if previous_front is not None and previous_front != front_empty:
+            remove_follower_drivers(previous_front)
+        assign_rna_property(track_settings, "driven_empty_object", front_empty)
+        ensure_follower_drivers(track_object, front_empty, offset_meters=0.0)
+        front_empty.coaster_mixer_follower.reverse_forward_axis = self.reverse_facing
+        mark_train_mount(front_empty, enabled=False)
+        existing_mounts = collect_track_followers(track_object)
+        base_offset = get_train_mount_total_length_meters(existing_mounts)
+        running_offset = base_offset
+        for empty_object, length_meters in zip(ordered_empties, mount_lengths):
+            running_offset += length_meters
+            ensure_follower_drivers(track_object, empty_object, offset_meters=running_offset)
+            empty_object.coaster_mixer_follower.reverse_forward_axis = self.reverse_facing
+            mark_train_mount(empty_object)
+
+        proposed_total_length = running_offset
+        if self.adjust_train_length:
+            track_settings.train_length_meters = proposed_total_length
+
+        station_message = ""
+        if self.adjust_station_length:
+            station = get_adjustable_seam_station(track_object)
+            if station is not None:
+                station_length = resize_seam_station(station, proposed_total_length)
+                station_message = f"; Station resized backward to {station_length:.2f} m"
 
         tag_track_placement_update(track_object)
         tag_redraw_view3d()
-        self.report({"INFO"}, f"Attached {len(selected_empties)} follower empties")
+        train_message = f"; train length set to {proposed_total_length:.2f} m" if self.adjust_train_length else ""
+        reverse_message = "; facing backward" if self.reverse_facing else ""
+        self.report({"INFO"}, f"Attached {len(ordered_empties)} train mounts behind {front_empty.name}{reverse_message}{train_message}{station_message}")
         return {"FINISHED"}
 
 
@@ -884,43 +975,198 @@ def resize_seam_station(station, requested_length):
     return new_length
 
 
+def get_selected_train_front_empty(context, selected_empties):
+    active_object = getattr(context.view_layer.objects, "active", None)
+    if active_object is not None and active_object.type == "EMPTY" and active_object in selected_empties:
+        return active_object
+    return selected_empties[0] if selected_empties else None
+
+
+def infer_selected_mount_layout(selected_empties, front_empty=None):
+    empties = [object_ref for object_ref in selected_empties if object_ref is not None and object_ref.type == "EMPTY"]
+    if not empties:
+        return [], [], 0.0
+    front_empty = front_empty if front_empty in empties else empties[0]
+    trailing_empties = [object_ref for object_ref in empties if object_ref != front_empty]
+    if not trailing_empties:
+        return [], [], 0.0
+
+    if len(trailing_empties) == 1:
+        only_empty = trailing_empties[0]
+        gap = max((only_empty.matrix_world.translation - front_empty.matrix_world.translation).length, 0.01)
+        return [only_empty], [gap], gap
+
+    farthest_object = None
+    farthest_distance_squared = -1.0
+    front_position = front_empty.matrix_world.translation
+    for object_ref in trailing_empties:
+        delta = object_ref.matrix_world.translation - front_position
+        distance_squared = delta.length_squared
+        if distance_squared > farthest_distance_squared:
+            farthest_distance_squared = distance_squared
+            farthest_object = object_ref
+
+    if farthest_object is None or farthest_distance_squared <= 1.0e-10:
+        ordered_empties = sorted(trailing_empties, key=lambda object_ref: object_ref.name)
+    else:
+        axis = farthest_object.matrix_world.translation - front_position
+        axis.normalize()
+        ordered_empties = sorted(
+            trailing_empties,
+            key=lambda object_ref: (object_ref.matrix_world.translation.dot(axis), object_ref.name),
+        )
+
+    gaps = []
+    previous_object = front_empty
+    for empty_object in ordered_empties:
+        gap = (empty_object.matrix_world.translation - previous_object.matrix_world.translation).length
+        gaps.append(max(gap, 0.01))
+        previous_object = empty_object
+
+    total_length = sum(gaps)
+    return ordered_empties, gaps, total_length
+
+
+class COASTERMIXER_OT_edit_train_mount_length(bpy.types.Operator):
+    bl_idname = "coaster_mixer.edit_train_mount_length"
+    bl_label = "Edit Car Length"
+    bl_description = "Change the gap to this car mount and shift this mount and everything behind it"
+    bl_options = {"REGISTER", "UNDO"}
+
+    empty_name: bpy.props.StringProperty(name="Empty Name")
+    length_meters: bpy.props.FloatProperty(
+        name="Length",
+        description="Gap from the previous train anchor in meters; changing it shifts this mount and every mount behind it",
+        min=0.01,
+        subtype="DISTANCE",
+        default=2.4,
+    )
+    adjust_train_length: bpy.props.BoolProperty(
+        name="Set Train Length",
+        description="Update the physical train length to match the resulting total mount layout",
+        default=True,
+    )
+    adjust_station_length: bpy.props.BoolProperty(
+        name="Resize Station to Train",
+        description="Match the seam Station to the resulting train length by moving its entry backward while keeping its exit at the coaster start",
+        default=True,
+    )
+
+    def _resolve_mount_context(self, context):
+        empty_object = bpy.data.objects.get(self.empty_name)
+        if empty_object is None or empty_object.type != "EMPTY":
+            return None, None, None, None
+        track_object = empty_object.coaster_mixer_follower.track_object
+        if track_object is None or track_object.type != "CURVE":
+            return empty_object, None, None, None
+        mounts = collect_track_followers(track_object)
+        try:
+            mount_index = next(index for index, mount in enumerate(mounts) if mount == empty_object)
+        except StopIteration:
+            return empty_object, track_object, track_object.coaster_mixer_track, None
+        return empty_object, track_object, track_object.coaster_mixer_track, mount_index
+
+    def invoke(self, context, _event):
+        _empty_object, _track_object, _track_settings, mount_index = self._resolve_mount_context(context)
+        if mount_index is None:
+            self.report({"WARNING"}, f"Train mount '{self.empty_name}' is no longer attached")
+            return {"CANCELLED"}
+        mounts = collect_track_followers(bpy.data.objects[self.empty_name].coaster_mixer_follower.track_object)
+        self.length_meters = max(get_train_mount_length_meters(mounts, mount_index), 0.01)
+        return context.window_manager.invoke_props_dialog(self, width=420)
+
+    def draw(self, context):
+        layout = self.layout
+        empty_object, track_object, track_settings, mount_index = self._resolve_mount_context(context)
+        if empty_object is None or track_object is None or track_settings is None or mount_index is None:
+            layout.label(text="Train mount is no longer available.", icon="ERROR")
+            return
+
+        mounts = collect_track_followers(track_object)
+        current_length = get_train_mount_length_meters(mounts, mount_index)
+        current_total_length = get_train_mount_total_length_meters(mounts)
+        delta = self.length_meters - current_length
+        proposed_total_length = max(current_total_length + delta, 0.0)
+
+        column = layout.column()
+        column.use_property_split = True
+        column.use_property_decorate = False
+        column.prop(self, "length_meters")
+
+        summary = layout.box()
+        summary.label(text=f"Train length: {current_total_length:.2f} m -> {proposed_total_length:.2f} m", icon="DRIVER_DISTANCE")
+        summary.prop(self, "adjust_train_length")
+
+        station = get_adjustable_seam_station(track_object)
+        station_column = summary.column()
+        station_column.enabled = station is not None
+        station_column.prop(self, "adjust_station_length")
+        if station is not None:
+            station_length = min(proposed_total_length, station["maximum_length"])
+            station_column.label(text=f"Station: {station['current_length']:.2f} m -> {station_length:.2f} m")
+            station_column.label(text="Exit stays at coaster start; entry moves backward.", icon="INFO")
+            if proposed_total_length > station["maximum_length"] + 1.0e-3:
+                station_column.label(text="Limited by the final track piece length.", icon="ERROR")
+        else:
+            summary.label(text="No adjustable Station ending at the coaster start.", icon="INFO")
+
+    def execute(self, context):
+        empty_object, track_object, track_settings, mount_index = self._resolve_mount_context(context)
+        if empty_object is None or track_object is None or track_settings is None or mount_index is None:
+            self.report({"WARNING"}, f"Train mount '{self.empty_name}' is no longer attached")
+            return {"CANCELLED"}
+
+        mounts = collect_track_followers(track_object)
+        current_length = get_train_mount_length_meters(mounts, mount_index)
+        delta = self.length_meters - current_length
+        if abs(delta) <= 1.0e-5:
+            return {"FINISHED"}
+
+        for mount in mounts[mount_index:]:
+            settings = mount.coaster_mixer_follower
+            settings.offset_meters = max(settings.offset_meters + delta, 0.0)
+
+        proposed_total_length = get_train_mount_total_length_meters(collect_track_followers(track_object))
+        if self.adjust_train_length:
+            track_settings.train_length_meters = proposed_total_length
+
+        station_message = ""
+        if self.adjust_station_length:
+            station = get_adjustable_seam_station(track_object)
+            if station is not None:
+                station_length = resize_seam_station(station, proposed_total_length)
+                station_message = f"; Station resized backward to {station_length:.2f} m"
+
+        tag_track_placement_update(track_object)
+        tag_redraw_view3d()
+        train_message = f"; train length set to {proposed_total_length:.2f} m" if self.adjust_train_length else ""
+        self.report({"INFO"}, f"Updated {empty_object.name} length to {self.length_meters:.2f} m{train_message}{station_message}")
+        return {"FINISHED"}
+
+
 class COASTERMIXER_OT_create_train_followers(bpy.types.Operator):
     bl_idname = "coaster_mixer.create_train_followers"
-    bl_label = "Create Car Empties"
-    bl_description = "Create a chain of follower empties spaced in meters behind the train front, ready to parent train cars to"
+    bl_label = "Create Car Mounts"
+    bl_description = "Create empty train mounts spaced in meters behind the train front, ready to parent train cars to"
     bl_options = {"REGISTER", "UNDO"}
 
     car_count: bpy.props.IntProperty(
         name="Car Count",
-        description="Number of follower empties to create",
+        description="Number of train mounts to create",
         min=1,
         max=64,
         default=4,
     )
-    car_spacing_meters: bpy.props.FloatProperty(
-        name="Car Spacing",
-        description="Arc-length distance between consecutive followers",
+    length_meters: bpy.props.FloatProperty(
+        name="Length",
+        description="Car length in meters; the same value is used as spacing between train mounts",
         min=0.01,
         subtype="DISTANCE",
         default=2.4,
-    )
-    car_length_meters: bpy.props.FloatProperty(
-        name="Car Length",
-        description="Physical length of each car, used to calculate the proposed full train length",
-        min=0.01,
-        subtype="DISTANCE",
-        default=2.4,
-    )
-    start_offset_meters: bpy.props.FloatProperty(
-        name="Start Offset",
-        description="Arc-length distance from the train front to the first follower",
-        min=0.0,
-        subtype="DISTANCE",
-        default=0.0,
     )
     adjust_train_length: bpy.props.BoolProperty(
         name="Set Train Length",
-        description="Set the physical train length to Car Count multiplied by Car Length",
+        description="Set the physical train length to the resulting full mount layout length",
         default=True,
     )
     adjust_station_length: bpy.props.BoolProperty(
@@ -935,6 +1181,11 @@ class COASTERMIXER_OT_create_train_followers(bpy.types.Operator):
         return track_object is not None
 
     def invoke(self, context, _event):
+        track_object, _track_settings = resolve_active_track_settings(context)
+        mounts = collect_track_followers(track_object) if track_object is not None else []
+        if mounts:
+            self.car_count = 1
+            self.length_meters = max(get_train_mount_length_meters(mounts, len(mounts) - 1), 0.01)
         return context.window_manager.invoke_props_dialog(self, width=420)
 
     def draw(self, context):
@@ -943,16 +1194,16 @@ class COASTERMIXER_OT_create_train_followers(bpy.types.Operator):
         column.use_property_split = True
         column.use_property_decorate = False
         column.prop(self, "car_count")
-        column.prop(self, "car_length_meters")
-        column.prop(self, "car_spacing_meters")
-        column.prop(self, "start_offset_meters")
+        column.prop(self, "length_meters")
 
-        proposed_length = self.car_count * self.car_length_meters
+        track_object, track_settings = resolve_active_track_settings(context)
+        mounts = collect_track_followers(track_object) if track_object is not None else []
+        current_total_length = get_train_mount_total_length_meters(mounts)
+        proposed_length = current_total_length + self.car_count * self.length_meters
         proposal = layout.box()
-        proposal.label(text=f"Calculated train length: {proposed_length:.2f} m", icon="DRIVER_DISTANCE")
+        proposal.label(text=f"Train length: {current_total_length:.2f} m -> {proposed_length:.2f} m", icon="DRIVER_DISTANCE")
         proposal.prop(self, "adjust_train_length")
 
-        track_object, _track_settings = resolve_active_track_settings(context)
         station = get_adjustable_seam_station(track_object) if track_object is not None else None
         station_column = proposal.column()
         station_column.enabled = station is not None
@@ -972,15 +1223,19 @@ class COASTERMIXER_OT_create_train_followers(bpy.types.Operator):
             self.report({"WARNING"}, "Select a curve object first")
             return {"CANCELLED"}
 
+        ensure_train_front_empty(track_object, track_settings, context.collection)
+        mounts = collect_track_followers(track_object)
+        base_offset = get_train_mount_total_length_meters(mounts)
         for car_index in range(self.car_count):
-            offset_meters = self.start_offset_meters + self.car_spacing_meters * car_index
+            offset_meters = base_offset + self.length_meters * (car_index + 1)
             empty_object = bpy.data.objects.new(f"{track_object.name} Car {car_index + 1:02d}", None)
             empty_object.empty_display_type = "PLAIN_AXES"
             empty_object.empty_display_size = 0.5
             context.collection.objects.link(empty_object)
             ensure_follower_drivers(track_object, empty_object, offset_meters=offset_meters)
+            mark_train_mount(empty_object)
 
-        proposed_length = self.car_count * self.car_length_meters
+        proposed_length = base_offset + self.car_count * self.length_meters
         if self.adjust_train_length:
             track_settings.train_length_meters = proposed_length
 
@@ -994,19 +1249,20 @@ class COASTERMIXER_OT_create_train_followers(bpy.types.Operator):
         tag_track_placement_update(track_object)
         tag_redraw_view3d()
         train_message = f"; train length set to {proposed_length:.2f} m" if self.adjust_train_length else ""
-        self.report({"INFO"}, f"Created {self.car_count} follower empties{train_message}{station_message}")
+        noun = "train mount" if self.car_count == 1 else "train mounts"
+        self.report({"INFO"}, f"Created {self.car_count} {noun}{train_message}{station_message}")
         return {"FINISHED"}
 
 
 class COASTERMIXER_OT_create_train_camera(bpy.types.Operator):
     bl_idname = "coaster_mixer.create_train_camera"
     bl_label = "Create Ride Camera"
-    bl_description = "Create a bank-following camera above the second train follower, aimed at a track-driven look-ahead target"
+    bl_description = "Create a bank-following camera above a main train empty, aimed at a track-driven look-ahead target"
     bl_options = {"REGISTER", "UNDO"}
 
     height_meters: bpy.props.FloatProperty(
         name="Height",
-        description="Camera height above the second follower in meters",
+        description="Camera height above the mounted train empty in meters",
         min=0.0,
         subtype="DISTANCE",
         default=1.6,
@@ -1041,12 +1297,12 @@ class COASTERMIXER_OT_create_train_camera(bpy.types.Operator):
 
     def execute(self, context):
         track_object, _track_settings = resolve_active_track_settings(context)
-        followers = collect_track_followers(track_object)
-        if len(followers) < 2:
-            self.report({"WARNING"}, "Create at least two car empties before creating the ride camera")
+        mounts = collect_main_train_mounts(track_object)
+        if len(mounts) < 1:
+            self.report({"WARNING"}, "Create or attach at least one main train empty before creating the ride camera")
             return {"CANCELLED"}
 
-        mount_object = followers[1]
+        mount_object = mounts[1] if len(mounts) > 1 else mounts[0]
         target_object = bpy.data.objects.new(f"{track_object.name} Camera Look Ahead", None)
         target_object.empty_display_type = "PLAIN_AXES"
         target_object.empty_display_size = 0.25
@@ -1087,10 +1343,58 @@ class COASTERMIXER_OT_create_train_camera(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class COASTERMIXER_OT_create_wheelcarrier_helpers(bpy.types.Operator):
+    bl_idname = "coaster_mixer.create_wheelcarrier_helpers"
+    bl_label = "Create Wheelcarrier Pairs"
+    bl_description = "Create or refresh symmetric left and right wheelcarrier helper empties for every main train empty"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        track_object, _track_settings = resolve_active_track_settings(context)
+        return track_object is not None and len(collect_main_train_mounts(track_object)) > 0
+
+    def execute(self, context):
+        track_object, _track_settings = resolve_active_track_settings(context)
+        mounts = collect_main_train_mounts(track_object)
+        if not mounts:
+            self.report({"WARNING"}, "Create or attach at least one main train empty first")
+            return {"CANCELLED"}
+
+        target_collection = context.collection if context.collection is not None else get_default_track_object_collection(track_object)
+        created_count = 0
+        refreshed_count = 0
+        for mount_object in mounts:
+            existing_helpers = {
+                helper_object.get("coaster_mixer_wheelcarrier_side", ""): helper_object
+                for helper_object in get_bound_wheelcarrier_helpers(mount_object)
+            }
+            for side_identifier, side_label in (("L", "Left"), ("R", "Right")):
+                helper_object = existing_helpers.get(side_identifier)
+                if helper_object is None:
+                    helper_object = bpy.data.objects.new(f"{mount_object.name} Wheelcarrier {side_label}", None)
+                    helper_object.empty_display_type = "PLAIN_AXES"
+                    helper_object.empty_display_size = 0.2
+                    target_collection.objects.link(helper_object)
+                    created_count += 1
+                else:
+                    refreshed_count += 1
+                helper_object["coaster_mixer_wheelcarrier_helper"] = True
+                helper_object["coaster_mixer_wheelcarrier_side"] = side_identifier
+                helper_object.coaster_mixer_follower.source_mount_object = mount_object
+                helper_object.coaster_mixer_follower.reverse_forward_axis = mount_object.coaster_mixer_follower.reverse_forward_axis
+                ensure_follower_drivers(track_object, helper_object, offset_meters=0.0)
+
+        tag_track_placement_update(track_object)
+        tag_redraw_view3d()
+        self.report({"INFO"}, f"Created {created_count} and refreshed {refreshed_count} wheelcarrier helpers")
+        return {"FINISHED"}
+
+
 class COASTERMIXER_OT_detach_follower(bpy.types.Operator):
     bl_idname = "coaster_mixer.detach_follower"
-    bl_label = "Detach Follower"
-    bl_description = "Remove the placement drivers from this follower empty and detach it from the track"
+    bl_label = "Remove Car Mount"
+    bl_description = "Remove this train mount and any train objects parented to it"
     bl_options = {"REGISTER", "UNDO"}
 
     empty_name: bpy.props.StringProperty(name="Empty Name")
@@ -1100,6 +1404,12 @@ class COASTERMIXER_OT_detach_follower(bpy.types.Operator):
         if empty_object is None:
             self.report({"WARNING"}, f"Object '{self.empty_name}' not found")
             return {"CANCELLED"}
+
+        if bool(empty_object.get("coaster_mixer_train_mount", False)):
+            remove_train_mount(empty_object)
+            tag_redraw_view3d()
+            self.report({"INFO"}, "Removed train mount")
+            return {"FINISHED"}
 
         remove_follower_drivers(empty_object)
         tag_redraw_view3d()

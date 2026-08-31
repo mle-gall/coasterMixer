@@ -628,6 +628,19 @@ class CoasterMixerFollowerSettings(bpy.types.PropertyGroup):
         default=0.0,
         update=follower_settings_update,
     )
+    reverse_forward_axis: bpy.props.BoolProperty(
+        name="Reverse Forward Axis",
+        description="Flip this empty 180 degrees around the local up axis while keeping the same sampled position and bank",
+        default=False,
+        update=follower_settings_update,
+    )
+    source_mount_object: bpy.props.PointerProperty(
+        name="Source Mount",
+        description="Main train empty this helper follows for its longitudinal placement",
+        type=bpy.types.Object,
+        poll=is_empty_object,
+        update=follower_settings_update,
+    )
 
 
 def is_camera_mount_object(settings, obj):
@@ -636,8 +649,8 @@ def is_camera_mount_object(settings, obj):
         and obj.type == "EMPTY"
         and settings.track_object is not None
         and obj.coaster_mixer_follower.track_object == settings.track_object
-        and obj != settings.track_object.coaster_mixer_track.driven_empty_object
         and not obj.get("coaster_mixer_camera_target", False)
+        and obj in collect_main_train_mounts(settings.track_object)
     )
 
 
@@ -696,8 +709,8 @@ class CoasterMixerCameraSettings(bpy.types.PropertyGroup):
         update=camera_settings_update,
     )
     mount_object: bpy.props.PointerProperty(
-        name="Mounted Car",
-        description="Train follower empty carrying this ride camera",
+        name="Mounted Empty",
+        description="Main train empty carrying this ride camera, including the train front empty",
         type=bpy.types.Object,
         poll=is_camera_mount_object,
         update=camera_settings_update,
@@ -822,11 +835,39 @@ class CoasterMixerTrackSettings(bpy.types.PropertyGroup):
         update=track_settings_update,
     )
     driven_empty_object: bpy.props.PointerProperty(
-        name="Driven Empty",
-        description="Empty object that follows the ride curve and drives the train rig",
+        name="Train Front Empty",
+        description="Empty object placed at the train front and used to drive the train rig",
         type=bpy.types.Object,
         poll=is_empty_object,
         update=driven_empty_object_update,
+    )
+    train_mount_vertical_offset_meters: bpy.props.FloatProperty(
+        name="Car Mount Height",
+        description="Global height offset applied to the train front empty and every car mount above the sampled track",
+        subtype="DISTANCE",
+        default=0.0,
+        update=track_settings_update,
+    )
+    wheelcarrier_lateral_offset_meters: bpy.props.FloatProperty(
+        name="Wheelcarrier Lateral",
+        description="Symmetric lateral offset from each main train empty to the left and right wheelcarrier helpers",
+        subtype="DISTANCE",
+        default=0.75,
+        update=track_settings_update,
+    )
+    wheelcarrier_longitudinal_offset_meters: bpy.props.FloatProperty(
+        name="Wheelcarrier Longitudinal",
+        description="Longitudinal offset from each main train empty to the wheelcarrier helpers in local mount space",
+        subtype="DISTANCE",
+        default=0.0,
+        update=track_settings_update,
+    )
+    wheelcarrier_vertical_offset_meters: bpy.props.FloatProperty(
+        name="Wheelcarrier Vertical",
+        description="Additional vertical offset from each main train empty to the wheelcarrier helpers in local mount space",
+        subtype="DISTANCE",
+        default=-0.35,
+        update=track_settings_update,
     )
     train_front_route_meters: bpy.props.FloatProperty(
         name="Train Front",

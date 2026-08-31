@@ -321,20 +321,28 @@ def coaster_mixer_depsgraph_update_handler(_scene, depsgraph):
     # everything here used to wipe all caches on every simulation frame
     # (the sim's own update_tag lands in this handler), forcing a full
     # Python re-sample of every piece per frame.
+    invalidate_all_routes = False
+    invalidate_curve_objects = False
     for update in depsgraph.updates:
         update_id = update.id
         if isinstance(update_id, bpy.types.Curve):
-            # Curve Tools and Edit Mode can reorder spline points without
-            # touching any Coaster Mixer property. Invalidate simulation and
-            # all route-derived data so the new first point becomes meter 0.
-            invalidate_route_cache()
-            return
+            invalidate_all_routes = True
+            break
         if isinstance(update_id, bpy.types.Object) and update_id.type == "CURVE":
             if getattr(update, "is_updated_geometry", False) or getattr(update, "is_updated_transform", False):
-                ROUTE_CACHE_BY_ROOT.clear()
-                PLACEMENT_SAMPLE_CACHE.clear()
-                PLACEMENT_CHANNEL_CACHE.clear()
-                return
+                invalidate_curve_objects = True
+                break
+    if invalidate_all_routes:
+        # Curve Tools and Edit Mode can reorder spline points without
+        # touching any Coaster Mixer property. Invalidate simulation and
+        # all route-derived data so the new first point becomes meter 0.
+        invalidate_route_cache()
+    elif invalidate_curve_objects:
+        ROUTE_CACHE_BY_ROOT.clear()
+        OFFSET_ROUTE_CACHE_BY_KEY.clear()
+        PLACEMENT_SAMPLE_CACHE.clear()
+        PLACEMENT_CHANNEL_CACHE.clear()
+    sync_train_mount_bindings()
 
 
 def ensure_depsgraph_update_handler():
@@ -354,6 +362,7 @@ def clear_runtime_caches():
     ROUTE_CACHE_BY_ROOT.clear()
     ROUTE_ZONE_CACHE_BY_ROOT.clear()
     OVERLAY_DRAW_CACHE_BY_OBJECT.clear()
+    OFFSET_ROUTE_CACHE_BY_KEY.clear()
     PLACEMENT_SAMPLE_CACHE.clear()
     PLACEMENT_CHANNEL_CACHE.clear()
     invalidate_simulation_trajectory()
@@ -667,26 +676,63 @@ class COASTERMIXER_PT_train(CoasterMixerPanelMixin, bpy.types.Panel):
         rig_column.use_property_split = True
         rig_column.use_property_decorate = False
         rig_column.prop(track_settings, "driven_empty_object")
+        rig_column.prop(track_settings, "train_mount_vertical_offset_meters")
 
         if track_settings.driven_empty_object is not None:
-            rig_box.operator("coaster_mixer.setup_driven_empty", text="Attach Driven Empty", icon="DRIVER")
+            rig_box.operator("coaster_mixer.setup_driven_empty", text="Attach Train Front Empty", icon="DRIVER")
         rig_box.label(text=get_follower_setup_status(track_object, track_settings.driven_empty_object))
+        if track_settings.driven_empty_object is not None:
+            rig_box.label(text=f"Lead anchor: {track_settings.driven_empty_object.name} @ 0.00 m", icon="EMPTY_AXIS")
+            rig_column.prop(track_settings.driven_empty_object.coaster_mixer_follower, "reverse_forward_axis", text="Lead Facing Backward")
+            rig_box.label(text="Uses the same Car Mount Height as the rest of the train.", icon="INFO")
 
         follower_box = layout.box()
-        follower_box.label(text="Followers", icon="LINKED")
-        followers = collect_track_followers(track_object)
-        if followers:
-            for follower_object in followers:
+        follower_box.label(text="Car Mounts", icon="LINKED")
+        mounts = collect_track_followers(track_object)
+        if mounts:
+            for mount_index, follower_object in enumerate(mounts):
+                length_meters = get_train_mount_length_meters(mounts, mount_index)
                 row = follower_box.row(align=True)
                 row.label(text=follower_object.name, icon="EMPTY_AXIS")
-                row.prop(follower_object.coaster_mixer_follower, "offset_meters", text="")
-                detach = row.operator("coaster_mixer.detach_follower", text="", icon="X")
+                edit = row.operator(
+                    "coaster_mixer.edit_train_mount_length",
+                    text=f"{length_meters:.2f} m",
+                    icon="DRIVER_DISTANCE",
+                )
+                edit.empty_name = follower_object.name
+                row.prop(
+                    follower_object.coaster_mixer_follower,
+                    "reverse_forward_axis",
+                    text="",
+                    icon="ARROW_LEFTRIGHT",
+                )
+                detach = row.operator("coaster_mixer.detach_follower", text="Remove", icon="X")
                 detach.empty_name = follower_object.name
         else:
-            follower_box.label(text="No follower empties attached yet.")
+            follower_box.label(text="No car mounts attached yet.")
         button_row = follower_box.row(align=True)
-        button_row.operator("coaster_mixer.create_train_followers", text="Create Cars", icon="OUTLINER_OB_EMPTY")
-        button_row.operator("coaster_mixer.attach_selected_followers", text="Attach Selected", icon="LINKED")
+        button_row.operator(
+            "coaster_mixer.create_train_followers",
+            text="Add Car" if mounts else "Create Cars",
+            icon="OUTLINER_OB_EMPTY",
+        )
+        button_row.operator("coaster_mixer.attach_selected_followers", text="Attach Selected Empties", icon="LINKED")
+
+        wheelcarrier_box = layout.box()
+        wheelcarrier_box.label(text="Wheelcarrier Helpers", icon="EMPTY_AXIS")
+        wheelcarrier_column = wheelcarrier_box.column()
+        wheelcarrier_column.use_property_split = True
+        wheelcarrier_column.use_property_decorate = False
+        wheelcarrier_column.prop(track_settings, "wheelcarrier_lateral_offset_meters")
+        wheelcarrier_column.prop(track_settings, "wheelcarrier_longitudinal_offset_meters")
+        wheelcarrier_column.prop(track_settings, "wheelcarrier_vertical_offset_meters")
+        helper_count = len(collect_wheelcarrier_helpers(track_object))
+        wheelcarrier_box.label(text=f"{helper_count} helper empties bound to the train.", icon="INFO")
+        wheelcarrier_box.operator(
+            "coaster_mixer.create_wheelcarrier_helpers",
+            text="Create / Refresh Pairs",
+            icon="OUTLINER_OB_EMPTY",
+        )
 
 
 class COASTERMIXER_PT_camera(CoasterMixerPanelMixin, bpy.types.Panel):
