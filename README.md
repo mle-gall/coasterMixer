@@ -52,8 +52,6 @@ Read the [Coaster Mixer Wiki](https://github.com/mle-gall/coasterMixer/wiki):
 - [Usage guide](https://github.com/mle-gall/coasterMixer/wiki/Usage-Guide)
 - [Troubleshooting and limitations](https://github.com/mle-gall/coasterMixer/wiki/Troubleshooting-and-Limitations)
 
-The Markdown source is also kept in [`wiki/`](wiki/Home.md) alongside the code.
-
 ## Quick start
 
 Coaster Mixer starts from a coaster-shaped Blender Curve. You can model that
