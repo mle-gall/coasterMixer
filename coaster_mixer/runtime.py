@@ -6,6 +6,7 @@ import gpu
 from bisect import bisect_left, bisect_right
 from math import atan2, ceil, log1p, pi, sin, tau
 from time import perf_counter
+from uuid import uuid4
 from mathutils import Matrix, Quaternion, Vector
 from mathutils.geometry import interpolate_bezier
 from gpu_extras.batch import batch_for_shader
@@ -40,6 +41,7 @@ FORCE_ZERO_COLOR = (0.10, 0.88, 0.48, 0.92)
 FORCE_MID_COLOR = (0.98, 0.86, 0.16, 0.94)
 FORCE_HIGH_COLOR = (0.98, 0.22, 0.10, 0.96)
 FORCE_NEGATIVE_COLOR = (0.12, 0.72, 1.0, 0.94)
+FORCE_OVERLAY_COLOR_BUCKETS = 24
 VIEWPORT_DRAW_HANDLER = None
 CONTROL_SELECTION_MSGBUS_OWNER = object()
 PROPERTY_SYNC_GUARD = False
@@ -47,6 +49,7 @@ SIMULATION_ENABLED_UPDATE_GUARD = False
 # Legacy constraint name kept only so older files can be cleaned up on attach.
 DRIVEN_EMPTY_CONSTRAINT_NAME = "CoasterMixerFollowPath"
 TRAIN_FRONT_METERS_DATA_PATH = "coaster_mixer_track.train_front_route_meters"
+TRAIN_TRAVEL_DISTANCE_DATA_PATH = "coaster_mixer_track.train_travel_distance_meters"
 FOLLOWER_OFFSET_DATA_PATH = "coaster_mixer_follower.offset_meters"
 ROUTE_MAX_PIECES = 64
 CONNECTION_END_ITEMS = [
@@ -55,6 +58,13 @@ CONNECTION_END_ITEMS = [
 ]
 PLACEMENT_DRIVER_FUNCTION_NAME = "cm_place"
 TRIGGER_DRIVER_FUNCTION_NAME = "cm_trigger"
+WHEEL_SPIN_BINDING_ID_PROPERTY = "coaster_mixer_wheel_spin_binding_id"
+WHEEL_SPIN_BINDING_TRACK_PROPERTY = "coaster_mixer_wheel_spin_track_name"
+WHEEL_SPIN_BASE_ROTATION_PROPERTY = "coaster_mixer_wheel_spin_base_rotation"
+WHEEL_SPIN_ROTATION_AXIS_PROPERTY = "coaster_mixer_wheel_spin_rotation_axis"
+STANDALONE_BAKE_PROPERTY = "coaster_mixer_standalone_bake"
+STANDALONE_BAKE_TRACK_PROPERTY = "coaster_mixer_standalone_bake_track"
+GENERATED_COLLECTION_ROOT_NAME = "Coaster Mixer Generated"
 PLACEMENT_SAMPLE_CACHE = {}
 PLACEMENT_CHANNEL_CACHE = {}
 PLACEMENT_SAMPLE_CACHE_LIMIT = 4096
@@ -178,6 +188,11 @@ TRAIN_MOUNT_AXIS_PRESET_ITEMS = [
         "Local +X follows travel and local +Y points down",
     ),
 ]
+WHEEL_SPIN_AXIS_ITEMS = [
+    ("X", "X", "Rotate wheel bones around local X"),
+    ("Y", "Y", "Rotate wheel bones around local Y"),
+    ("Z", "Z", "Rotate wheel bones around local Z"),
+]
 CONTROL_RESPONSE_CURVE_ITEMS = [
     ("LINEAR", "Linear", "Apply a constant acceleration or deceleration limit toward the target speed"),
     ("SMOOTH", "Smooth", "Ease in toward the target speed with a gentler finish"),
@@ -240,6 +255,50 @@ def is_curve_object(_self, obj):
 
 def is_empty_object(_self, obj):
     return obj is not None and obj.type == "EMPTY"
+
+
+def is_armature_object(_self, obj):
+    return obj is not None and obj.type == "ARMATURE"
+
+
+def generate_wheel_spin_binding_key():
+    return uuid4().hex
+
+
+def get_wheel_spin_axis_index(axis_identifier):
+    return {"X": 0, "Y": 1, "Z": 2}.get(axis_identifier, 0)
+
+
+def wheel_spin_binding_update(settings, _context):
+    owner = getattr(settings, "id_data", None)
+    if owner is None or owner.type != "CURVE":
+        return
+    if not getattr(settings, "binding_key", ""):
+        assign_rna_property(settings, "binding_key", generate_wheel_spin_binding_key())
+    sync_wheel_spin_bindings()
+    tag_redraw_view3d()
+
+
+def get_armature_bone_collection_items(settings, _context):
+    armature_object = getattr(settings, "armature_object", None)
+    if armature_object is None or armature_object.type != "ARMATURE" or armature_object.data is None:
+        return [("", "No Armature", "Select an armature first")]
+
+    collection_items = []
+    for collection in getattr(armature_object.data, "collections_all", []):
+        collection_items.append((collection.name, collection.name, f"{len(getattr(collection, 'bones_recursive', []))} wheel bones"))
+    if not collection_items:
+        return [("", "No Bone Collections", "The selected armature has no bone collections")]
+    return collection_items
+
+
+def get_bone_collection_by_name(armature_object, collection_name):
+    if armature_object is None or armature_object.type != "ARMATURE" or armature_object.data is None:
+        return None
+    for collection in getattr(armature_object.data, "collections_all", []):
+        if collection.name == collection_name:
+            return collection
+    return None
 
 
 def tag_redraw_view3d():
@@ -1544,6 +1603,44 @@ def coaster_mixer_trigger_driver(channel):
         return 0.0
 
 
+def resolve_trajectory_travel_distance(cache, index):
+    if cache is None:
+        return 0.0
+
+    travel_distances = cache.get("travel_distances", [])
+    if not travel_distances:
+        return 0.0
+
+    cycle_length = cache.get("cycle_length")
+    cycle_start = cache.get("cycle_start")
+    cycle_distance = cache.get("cycle_distance")
+    if (
+        cycle_length is not None
+        and cycle_length > 0
+        and cycle_start is not None
+        and cycle_distance is not None
+        and index >= cycle_start
+    ):
+        loop_count, cycle_offset = divmod(index - cycle_start, cycle_length)
+        resolved_index = min(cycle_start + cycle_offset, len(travel_distances) - 1)
+        return (
+            travel_distances[cycle_start]
+            + loop_count * cycle_distance
+            + (travel_distances[resolved_index] - travel_distances[cycle_start])
+        )
+    return travel_distances[min(index, len(travel_distances) - 1)]
+
+
+def sample_simulation_travel_distance(scene, track_object, track_settings, frame):
+    cache, _route = get_simulation_trajectory_cache(scene, track_object, track_settings)
+    if cache is None:
+        return max(getattr(track_settings, "train_front_route_meters", 0.0), 0.0)
+
+    frame_index = max(int(round(frame)), 0)
+    sample_simulation_trajectory(scene, track_object, track_settings, frame_index)
+    return resolve_trajectory_travel_distance(cache, frame_index)
+
+
 def ensure_driver_namespace():
     bpy.app.driver_namespace[PLACEMENT_DRIVER_FUNCTION_NAME] = coaster_mixer_placement_driver
     bpy.app.driver_namespace[TRIGGER_DRIVER_FUNCTION_NAME] = coaster_mixer_trigger_driver
@@ -1619,6 +1716,20 @@ def draw_line_segment(start_point, end_point, color, width):
     if start_point is None or end_point is None:
         return
     draw_polyline([start_point, end_point], color, width)
+
+
+def draw_line_segments(points, color, width):
+    if not points or len(points) < 2:
+        return
+
+    shader = gpu.shader.from_builtin("POLYLINE_UNIFORM_COLOR")
+    batch = batch_for_shader(shader, "LINES", {"pos": [tuple(point) for point in points]})
+    viewport = gpu.state.viewport_get()
+    shader.bind()
+    shader.uniform_float("viewportSize", (viewport[2], viewport[3]))
+    shader.uniform_float("lineWidth", width)
+    shader.uniform_float("color", color)
+    batch.draw(shader)
 
 
 def clamp_zone_span(track_object, zone):
@@ -1951,6 +2062,36 @@ def get_signed_force_overlay_color(force_g, max_g):
     return lerp_color(FORCE_MID_COLOR, FORCE_HIGH_COLOR, (normalized - 0.5) * 2.0)
 
 
+def get_force_overlay_color_bucket(force_g, max_g):
+    clamped_force = clamp(force_g, -max_g, max_g)
+    normalized = clamp((clamped_force + max_g) / max(max_g * 2.0, 1.0e-6), 0.0, 1.0)
+    bucket_index = int(round(normalized * FORCE_OVERLAY_COLOR_BUCKETS))
+    bucket_index = max(0, min(FORCE_OVERLAY_COLOR_BUCKETS, bucket_index))
+    bucket_force = ((bucket_index / FORCE_OVERLAY_COLOR_BUCKETS) * 2.0 - 1.0) * max_g
+    return bucket_index, get_signed_force_overlay_color(bucket_force, max_g)
+
+
+def get_force_overlay_metrics(route, distance, speed_mps):
+    if route["total_length"] <= 1.0e-8:
+        return None
+    wrapped_distance = wrap_route_distance(route, distance)
+    _location, rotation = sample_route_placement(route, wrapped_distance)
+    if rotation is None:
+        return None
+
+    curvature_acceleration = sample_route_curvature_vector(route, wrapped_distance) * (speed_mps * speed_mps)
+    local_side = rotation @ Vector((1.0, 0.0, 0.0))
+    local_up = rotation @ Vector((0.0, 0.0, 1.0))
+    lateral_g_signed = curvature_acceleration.dot(local_side) / GRAVITY_ACCELERATION
+    apparent_acceleration = curvature_acceleration - Vector((0.0, 0.0, -GRAVITY_ACCELERATION))
+    vertical_g_signed = apparent_acceleration.dot(local_up) / GRAVITY_ACCELERATION
+    return {
+        "rotation": rotation,
+        "lateral_g_signed": lateral_g_signed,
+        "vertical_g_signed": vertical_g_signed,
+    }
+
+
 def get_route_speed_profile_samples(scene, track_object, track_settings, route):
     cache, _resolved_route = get_simulation_trajectory_cache(scene, track_object, track_settings)
     if cache is None:
@@ -2034,8 +2175,8 @@ def build_force_overlay_segments(scene, track_object, track_settings, route):
     fallback_speed = max(getattr(scene_settings, "simulation_current_speed_mps", 0.0), 0.0)
     profile_samples = get_route_speed_profile_samples(scene, track_object, track_settings, route)
 
-    vertical_segments = []
-    lateral_segments = []
+    vertical_batches = {}
+    lateral_batches = {}
     sample_count = max(int(ceil(route["total_length"] / step_meters)), 1)
     for sample_index in range(sample_count + 1):
         distance = min(sample_index * step_meters, route["total_length"])
@@ -2043,33 +2184,31 @@ def build_force_overlay_segments(scene, track_object, track_settings, route):
         if location is None or rotation is None:
             continue
         speed_mps = sample_route_speed_profile(profile_samples, route, distance, fallback_speed)
-        metrics = get_simulation_overlay_metrics(scene, track_object, track_settings, route, distance, speed_mps)
+        metrics = get_force_overlay_metrics(route, distance, speed_mps)
         if metrics is None:
             continue
-        local_side = rotation @ Vector((1.0, 0.0, 0.0))
-        local_up = rotation @ Vector((0.0, 0.0, 1.0))
+        local_side = metrics["rotation"] @ Vector((1.0, 0.0, 0.0))
+        local_up = metrics["rotation"] @ Vector((0.0, 0.0, 1.0))
         base_point = location
 
         if scene_settings.show_vertical_force_overlays:
             vertical_force_g = metrics["vertical_g_signed"]
             vertical_length = clamp(vertical_force_g, -max_g, max_g) * scale_meters
             if abs(vertical_length) > 1.0e-5:
-                vertical_segments.append((
-                    base_point,
-                    base_point + local_up * vertical_length,
-                    get_signed_force_overlay_color(vertical_force_g, max_g),
-                ))
+                bucket_index, bucket_color = get_force_overlay_color_bucket(vertical_force_g, max_g)
+                batch_points = vertical_batches.setdefault(bucket_index, {"color": bucket_color, "points": []})
+                batch_points["points"].extend((base_point, base_point + local_up * vertical_length))
 
         if scene_settings.show_lateral_force_overlays:
             lateral_force_g = metrics["lateral_g_signed"]
             lateral_length = clamp(lateral_force_g, -max_g, max_g) * scale_meters
             if abs(lateral_length) > 1.0e-5:
-                lateral_segments.append((
-                    base_point,
-                    base_point + local_side * lateral_length,
-                    get_signed_force_overlay_color(lateral_force_g, max_g),
-                ))
+                bucket_index, bucket_color = get_force_overlay_color_bucket(lateral_force_g, max_g)
+                batch_points = lateral_batches.setdefault(bucket_index, {"color": bucket_color, "points": []})
+                batch_points["points"].extend((base_point, base_point + local_side * lateral_length))
 
+    vertical_segments = [vertical_batches[key] for key in sorted(vertical_batches.keys())]
+    lateral_segments = [lateral_batches[key] for key in sorted(lateral_batches.keys())]
     return vertical_segments, lateral_segments
 
 
@@ -2274,10 +2413,10 @@ def draw_viewport_overlay():
         draw_points(draw_data["control_position_points"], CONTROL_POSITION_COLOR, 20.0)
         draw_points(draw_data["control_hold_points"], CONTROL_BRAKE_COLOR, 22.0)
     if scene_settings is not None and scene_settings.show_force_overlays:
-        for start_point, end_point, color in draw_data["vertical_force_segments"]:
-            draw_line_segment(start_point, end_point, color, 2.0)
-        for start_point, end_point, color in draw_data["lateral_force_segments"]:
-            draw_line_segment(start_point, end_point, color, 2.0)
+        for batch in draw_data["vertical_force_segments"]:
+            draw_line_segments(batch["points"], batch["color"], 2.0)
+        for batch in draw_data["lateral_force_segments"]:
+            draw_line_segments(batch["points"], batch["color"], 2.0)
     draw_polyline(draw_data["active_points"], ACTIVE_ZONE_COLOR, 12.0)
     for line in draw_data["start_arrow_lines"]:
         draw_polyline(line, START_MARKER_COLOR, 4.0)
@@ -2407,7 +2546,7 @@ def get_action_fcurve(owner, data_path):
     return None
 
 
-def get_action_fcurve_owner(owner, data_path):
+def get_action_fcurve_owner(owner, data_path, array_index=0):
     animation_data = getattr(owner, "animation_data", None)
     action = getattr(animation_data, "action", None)
     if action is None:
@@ -2415,7 +2554,7 @@ def get_action_fcurve_owner(owner, data_path):
 
     fcurves = getattr(action, "fcurves", None)
     if fcurves is not None:
-        return fcurves.find(data_path), fcurves
+        return fcurves.find(data_path, index=array_index), fcurves
 
     action_slot = getattr(animation_data, "action_slot", None)
     if action_slot is None:
@@ -2443,15 +2582,15 @@ def get_action_fcurve_owner(owner, data_path):
             if channelbag_fcurves is None:
                 continue
 
-            fcurve = channelbag_fcurves.find(data_path)
+            fcurve = channelbag_fcurves.find(data_path, index=array_index)
             if fcurve is not None:
                 return fcurve, channelbag_fcurves
 
     return None, None
 
 
-def clear_action_fcurve(owner, data_path):
-    fcurve, fcurve_collection = get_action_fcurve_owner(owner, data_path)
+def clear_action_fcurve(owner, data_path, array_index=0):
+    fcurve, fcurve_collection = get_action_fcurve_owner(owner, data_path, array_index)
     if fcurve is None or fcurve_collection is None:
         return False
 
@@ -2466,16 +2605,23 @@ def insert_dense_fcurve_keyframes(owner, data_path, frame_values):
     animation_data = owner.animation_data_create()
     action = getattr(animation_data, "action", None)
     if action is None:
-        action = bpy.data.actions.new(name=f"{owner.name}Action")
+        action = bpy.data.actions.new(name=f"CM Generated - {owner.name} Bake")
         animation_data.action = action
 
     fcurves = getattr(action, "fcurves", None)
     if fcurves is None:
-        return None
-
-    fcurve = fcurves.find(data_path)
-    if fcurve is None:
-        fcurve = fcurves.new(data_path=data_path)
+        try:
+            owner.keyframe_insert(data_path=data_path, frame=frame_values[0][0])
+        except (TypeError, ValueError, RuntimeError):
+            return None
+        fcurve, _fcurve_collection = get_action_fcurve_owner(owner, data_path)
+        if fcurve is None:
+            return None
+        fcurve.keyframe_points.clear()
+    else:
+        fcurve = fcurves.find(data_path)
+        if fcurve is None:
+            fcurve = fcurves.new(data_path=data_path)
 
     try:
         keyframe_points = fcurve.keyframe_points
@@ -2495,6 +2641,77 @@ def insert_dense_fcurve_keyframes(owner, data_path, frame_values):
         return None
 
     return fcurve
+
+
+def insert_dense_indexed_fcurve_keyframes(owner, data_path, array_index, frame_values):
+    if not frame_values:
+        return None
+    animation_data = owner.animation_data_create()
+    action = getattr(animation_data, "action", None)
+    if action is None:
+        action = bpy.data.actions.new(name=f"CM Generated - {owner.name} Bake")
+        animation_data.action = action
+    fcurves = getattr(action, "fcurves", None)
+    if fcurves is None:
+        clear_action_fcurve(owner, data_path, array_index)
+        try:
+            owner.keyframe_insert(
+                data_path=data_path,
+                index=array_index,
+                frame=frame_values[0][0],
+            )
+        except (TypeError, ValueError, RuntimeError):
+            return None
+        fcurve, _fcurve_collection = get_action_fcurve_owner(
+            owner, data_path, array_index
+        )
+        if fcurve is None:
+            return None
+        fcurve.keyframe_points.clear()
+    else:
+        clear_action_fcurve(owner, data_path, array_index)
+        fcurve = fcurves.new(data_path=data_path, index=array_index)
+    try:
+        keyframe_points = fcurve.keyframe_points
+        keyframe_points.add(len(frame_values))
+        coordinates = []
+        for frame, value in frame_values:
+            coordinates.extend((float(frame), float(value)))
+        keyframe_points.foreach_set("co", coordinates)
+        set_fcurve_linear(fcurve)
+        keyframe_points.update()
+        fcurve.update()
+    except Exception:
+        clear_action_fcurve(owner, data_path, array_index)
+        return None
+    return fcurve
+
+
+def clear_standalone_visual_bake(track_object):
+    track_name = track_object.name
+    cleared = False
+    for object_ref in bpy.data.objects:
+        if object_ref.get(STANDALONE_BAKE_TRACK_PROPERTY) != track_name:
+            continue
+        for data_path in ("location", "rotation_euler"):
+            for axis_index in range(3):
+                cleared = clear_action_fcurve(object_ref, data_path, axis_index) or cleared
+        object_ref.pop(STANDALONE_BAKE_TRACK_PROPERTY, None)
+    for binding in get_track_wheel_spin_bindings(track_object):
+        armature_object = binding.armature_object
+        axis_index = get_wheel_spin_axis_index(binding.rotation_axis)
+        for pose_bone in get_wheel_spin_pose_bones(armature_object, binding.bone_collection_name):
+            data_path = get_wheel_spin_bone_data_path(pose_bone)
+            cleared = clear_action_fcurve(armature_object, data_path, axis_index) or cleared
+    for property_name in (
+        "cm_baked_speed_mps", "cm_baked_lateral_g", "cm_baked_vertical_g",
+        "cm_baked_longitudinal_g", "cm_baked_total_g",
+    ):
+        clear_action_fcurve(bpy.context.scene, f'["{property_name}"]')
+        bpy.context.scene.pop(property_name, None)
+    track_object.pop(STANDALONE_BAKE_PROPERTY, None)
+    sync_wheel_spin_bindings()
+    return cleared
 
 
 def set_fcurve_linear(fcurve):
@@ -2583,6 +2800,33 @@ def get_default_track_object_collection(track_object):
     return None
 
 
+def get_generated_track_collection(track_object, role_name="Helpers"):
+    scene = getattr(bpy.context, "scene", None)
+    if scene is None or track_object is None:
+        return get_default_track_object_collection(track_object)
+
+    root_collection = bpy.data.collections.get(GENERATED_COLLECTION_ROOT_NAME)
+    if root_collection is None:
+        root_collection = bpy.data.collections.new(GENERATED_COLLECTION_ROOT_NAME)
+    if root_collection.name not in scene.collection.children:
+        scene.collection.children.link(root_collection)
+
+    track_collection_name = f"CM Generated - {track_object.name}"
+    track_collection = bpy.data.collections.get(track_collection_name)
+    if track_collection is None:
+        track_collection = bpy.data.collections.new(track_collection_name)
+    if track_collection.name not in root_collection.children:
+        root_collection.children.link(track_collection)
+
+    role_collection_name = f"{track_collection_name} - {role_name}"
+    role_collection = bpy.data.collections.get(role_collection_name)
+    if role_collection is None:
+        role_collection = bpy.data.collections.new(role_collection_name)
+    if role_collection.name not in track_collection.children:
+        track_collection.children.link(role_collection)
+    return role_collection
+
+
 def ensure_train_front_empty(track_object, track_settings, target_collection=None):
     if track_object is None or track_object.type != "CURVE" or track_settings is None:
         return None
@@ -2592,7 +2836,7 @@ def ensure_train_front_empty(track_object, track_settings, target_collection=Non
         ensure_follower_drivers(track_object, driven_empty_object, offset_meters=0.0)
         return driven_empty_object
 
-    target_collection = target_collection or get_default_track_object_collection(track_object)
+    target_collection = target_collection or get_generated_track_collection(track_object, "Train Rig")
     if target_collection is None:
         return None
 
@@ -2613,6 +2857,199 @@ def remove_follower_drivers(empty_object):
         assign_rna_property(follower_settings, "track_object", None)
     if "coaster_mixer_batched_placement" in empty_object:
         del empty_object["coaster_mixer_batched_placement"]
+
+
+def get_wheel_spin_pose_bones(armature_object, collection_name):
+    collection = get_bone_collection_by_name(armature_object, collection_name)
+    if collection is None or getattr(armature_object, "pose", None) is None:
+        return []
+    pose_bones = []
+    for bone in getattr(collection, "bones_recursive", []):
+        pose_bone = armature_object.pose.bones.get(bone.name)
+        if pose_bone is not None:
+            pose_bones.append(pose_bone)
+    pose_bones.sort(key=lambda pose_bone: pose_bone.name)
+    return pose_bones
+
+
+def get_wheel_spin_bone_data_path(pose_bone):
+    return pose_bone.path_from_id("rotation_euler")
+
+
+def wheel_spin_driver_is_valid(fcurve):
+    driver = getattr(fcurve, "driver", None)
+    return bool(
+        driver is not None
+        and driver.type == "SCRIPTED"
+        and (
+            driver.expression.startswith("wheel_travel * ")
+            or (
+                driver.use_self
+                and "cm_wheel_spin(" in driver.expression
+            )
+        )
+    )
+
+
+def remove_wheel_spin_driver_axis(armature_object, pose_bone, axis_index):
+    data_path = get_wheel_spin_bone_data_path(pose_bone)
+    fcurve = get_driver_fcurve_indexed(armature_object, data_path, axis_index)
+    if fcurve is None or not wheel_spin_driver_is_valid(fcurve):
+        return False
+    try:
+        armature_object.driver_remove(data_path, axis_index)
+    except (TypeError, ValueError, RuntimeError):
+        return False
+
+    stored_axis = int(pose_bone.get(WHEEL_SPIN_ROTATION_AXIS_PROPERTY, -1))
+    restored_rotation = (
+        float(pose_bone.get(WHEEL_SPIN_BASE_ROTATION_PROPERTY, 0.0))
+        if stored_axis == axis_index
+        else 0.0
+    )
+    pose_bone.rotation_euler[axis_index] = restored_rotation
+    return True
+
+
+def remove_wheel_spin_driver(armature_object, pose_bone, clear_properties=True):
+    if armature_object is None or pose_bone is None:
+        return False
+    removed = False
+    for axis_index in range(3):
+        removed = remove_wheel_spin_driver_axis(armature_object, pose_bone, axis_index) or removed
+    if clear_properties:
+        pose_bone.pop(WHEEL_SPIN_BINDING_ID_PROPERTY, None)
+        pose_bone.pop(WHEEL_SPIN_BINDING_TRACK_PROPERTY, None)
+        pose_bone.pop(WHEEL_SPIN_BASE_ROTATION_PROPERTY, None)
+        pose_bone.pop(WHEEL_SPIN_ROTATION_AXIS_PROPERTY, None)
+    return removed
+
+
+def configure_wheel_spin_driver(fcurve, track_object, binding, axis_index):
+    driver = fcurve.driver
+    driver.type = "SCRIPTED"
+    driver.use_self = False
+    direction_sign = -1.0 if getattr(binding, "invert_rotation", False) else 1.0
+    driver.expression = f"wheel_travel * {(2.0 / max(binding.wheel_diameter_meters, 1.0e-6) * direction_sign):.12f}"
+
+    while driver.variables:
+        driver.variables.remove(driver.variables[0])
+
+    travel_variable = driver.variables.new()
+    travel_variable.name = "wheel_travel"
+    travel_variable.type = "SINGLE_PROP"
+    travel_target = travel_variable.targets[0]
+    travel_target.id = track_object
+    travel_target.data_path = TRAIN_TRAVEL_DISTANCE_DATA_PATH
+
+
+def ensure_wheel_spin_driver(track_object, binding, pose_bone):
+    if track_object is None or binding is None or pose_bone is None:
+        return False
+    armature_object = binding.armature_object
+    if armature_object is None or armature_object.type != "ARMATURE":
+        return False
+
+    axis_index = get_wheel_spin_axis_index(binding.rotation_axis)
+    data_path = get_wheel_spin_bone_data_path(pose_bone)
+    target_fcurve = get_driver_fcurve_indexed(armature_object, data_path, axis_index)
+    # Bone animation may belong to the imported rig or to the artist. Managed
+    # wheel bindings must never replace a driver they do not own.
+    if target_fcurve is not None and not wheel_spin_driver_is_valid(target_fcurve):
+        return False
+    if pose_bone.rotation_mode != "XYZ":
+        pose_bone.rotation_mode = "XYZ"
+
+    for other_axis_index in range(3):
+        if other_axis_index == axis_index:
+            continue
+        remove_wheel_spin_driver_axis(armature_object, pose_bone, other_axis_index)
+
+    if target_fcurve is None:
+        base_rotation = float(pose_bone.rotation_euler[axis_index])
+        try:
+            target_fcurve = armature_object.driver_add(data_path, axis_index)
+        except (TypeError, ValueError, RuntimeError):
+            return False
+        pose_bone[WHEEL_SPIN_BASE_ROTATION_PROPERTY] = base_rotation
+        pose_bone[WHEEL_SPIN_ROTATION_AXIS_PROPERTY] = axis_index
+    elif WHEEL_SPIN_ROTATION_AXIS_PROPERTY not in pose_bone:
+        # Bindings saved before base-rotation tracking used zero as their
+        # authored rotation, so cleanup should return them to zero.
+        pose_bone[WHEEL_SPIN_BASE_ROTATION_PROPERTY] = 0.0
+        pose_bone[WHEEL_SPIN_ROTATION_AXIS_PROPERTY] = axis_index
+    configure_wheel_spin_driver(target_fcurve, track_object, binding, axis_index)
+    pose_bone[WHEEL_SPIN_BINDING_ID_PROPERTY] = binding.binding_key
+    pose_bone[WHEEL_SPIN_BINDING_TRACK_PROPERTY] = track_object.name
+    return True
+
+
+def get_track_wheel_spin_bindings(track_object):
+    if track_object is None or track_object.type != "CURVE":
+        return []
+    bindings = []
+    for binding in getattr(track_object.coaster_mixer_track, "wheel_spin_bindings", []):
+        binding_key = getattr(binding, "binding_key", "")
+        if not binding_key:
+            assign_rna_property(binding, "binding_key", generate_wheel_spin_binding_key())
+            binding_key = binding.binding_key
+        bindings.append(binding)
+    return bindings
+
+
+def sync_wheel_spin_bindings():
+    desired_by_key = {}
+    for track_object in bpy.data.objects:
+        if track_object.type != "CURVE" or not hasattr(track_object, "coaster_mixer_track"):
+            continue
+        if track_object.get(STANDALONE_BAKE_PROPERTY, False):
+            continue
+        for binding in get_track_wheel_spin_bindings(track_object):
+            if binding.binding_key in desired_by_key:
+                # Duplicating a track duplicates collection item values too.
+                # Give the copy independent ownership instead of silently
+                # letting it steal the original binding's managed drivers.
+                assign_rna_property(binding, "binding_key", generate_wheel_spin_binding_key())
+            armature_object = binding.armature_object
+            desired_by_key[binding.binding_key] = {
+                "track_object": track_object,
+                "armature_object": armature_object,
+                "binding": binding,
+                "axis_index": get_wheel_spin_axis_index(binding.rotation_axis),
+                "bone_names": {
+                    pose_bone.name for pose_bone in get_wheel_spin_pose_bones(
+                        armature_object,
+                        binding.bone_collection_name,
+                    )
+                } if armature_object is not None and binding.bone_collection_name else set(),
+            }
+
+    for armature_object in [object_ref for object_ref in bpy.data.objects if object_ref.type == "ARMATURE"]:
+        pose = getattr(armature_object, "pose", None)
+        if pose is None:
+            continue
+        for pose_bone in pose.bones:
+            binding_key = pose_bone.get(WHEEL_SPIN_BINDING_ID_PROPERTY)
+            if not binding_key:
+                continue
+            desired = desired_by_key.get(binding_key)
+            if (
+                desired is None
+                or desired["armature_object"] != armature_object
+                or pose_bone.name not in desired["bone_names"]
+            ):
+                remove_wheel_spin_driver(armature_object, pose_bone)
+
+    for desired in desired_by_key.values():
+        track_object = desired["track_object"]
+        binding = desired["binding"]
+        armature_object = desired["armature_object"]
+        if armature_object is None or armature_object.type != "ARMATURE":
+            continue
+        if get_bone_collection_by_name(armature_object, binding.bone_collection_name) is None:
+            continue
+        for pose_bone in get_wheel_spin_pose_bones(armature_object, binding.bone_collection_name):
+            ensure_wheel_spin_driver(track_object, binding, pose_bone)
 
 
 def mark_train_mount(empty_object, enabled=True):
@@ -2649,6 +3086,20 @@ def get_bound_wheelcarrier_helpers(source_mount_object):
             and object_ref.coaster_mixer_follower.source_mount_object == source_mount_object
         )
     ]
+
+
+def get_camera_target_owner(track_object, target_object):
+    if track_object is None or target_object is None:
+        return None
+    for camera_object in collect_ride_cameras(track_object):
+        camera_settings = getattr(camera_object, "coaster_mixer_camera", None)
+        if (
+            camera_settings is not None
+            and camera_settings.track_object == track_object
+            and camera_settings.target_object == target_object
+        ):
+            return camera_object
+    return None
 
 
 def remove_object_hierarchy(object_ref):
@@ -2803,6 +3254,8 @@ def get_track_placement_source_mount(track_object, follower_object):
 def get_track_placement_offset_meters(track_object, follower_object):
     if track_object is None or follower_object is None:
         return 0.0
+    if follower_object.get("coaster_mixer_camera_target", False):
+        return follower_object.coaster_mixer_follower.offset_meters
     source_mount_object = get_track_placement_source_mount(track_object, follower_object)
     if source_mount_object is not None:
         if source_mount_object == track_object.coaster_mixer_track.driven_empty_object:
@@ -2815,6 +3268,19 @@ def get_track_placement_local_offset(track_object, follower_object):
     if track_object is None or follower_object is None:
         return Vector((0.0, 0.0, 0.0))
     track_settings = track_object.coaster_mixer_track
+    if follower_object.get("coaster_mixer_camera_target", False):
+        camera_object = get_camera_target_owner(track_object, follower_object)
+        if camera_object is not None:
+            camera_settings = getattr(camera_object, "coaster_mixer_camera", None)
+            if camera_settings is not None and camera_settings.mount_object is not None:
+                target_offset = Vector(camera_settings.target_offset_xyz)
+                target_offset = rotate_local_offset_for_mount_axes(
+                    camera_settings.mount_object,
+                    target_offset,
+                )
+                target_offset.z += track_settings.train_mount_vertical_offset_meters
+                return target_offset
+        return Vector((0.0, 0.0, follower_object.coaster_mixer_follower.vertical_offset_meters))
     if follower_object.get("coaster_mixer_wheelcarrier_helper", False):
         side_identifier = follower_object.get("coaster_mixer_wheelcarrier_side", "L")
         lateral_sign = 1.0 if side_identifier == "L" else -1.0
@@ -2917,6 +3383,17 @@ def get_track_placement_rotation(follower_object, base_rotation, track_object=No
     ):
         source_mount_object = get_track_placement_source_mount(track_object, follower_object)
         if source_mount_object is not None:
+            reverse_forward_axis = source_mount_object.coaster_mixer_follower.reverse_forward_axis
+    elif (
+        track_object is not None
+        and follower_object.get("coaster_mixer_camera_target", False)
+    ):
+        source_mount_object = follower_object.coaster_mixer_follower.source_mount_object
+        if (
+            source_mount_object is not None
+            and source_mount_object.type == "EMPTY"
+            and source_mount_object.coaster_mixer_follower.track_object == track_object
+        ):
             reverse_forward_axis = source_mount_object.coaster_mixer_follower.reverse_forward_axis
     rotation = base_rotation @ axis_correction
     if bool(reverse_forward_axis) != global_reverse:
@@ -3151,8 +3628,8 @@ def collect_ride_cameras(track_object):
                 )
                 assign_rna_property(
                     camera_settings,
-                    "target_vertical_offset_meters",
-                    camera_object.location.z,
+                    "target_offset_xyz",
+                    (0.0, 0.0, camera_object.location.z),
                 )
             cameras.append(camera_object)
     cameras.sort(key=lambda camera_object: camera_object.name)
@@ -4168,11 +4645,13 @@ def get_simulation_trajectory_cache(scene, track_object, track_settings):
             "fronts": [state["front"]],
             "speeds": [state["speed"]],
             "stops": [state["wait"]],
+            "travel_distances": [0.0],
             "state": state,
             "seen_states": {quantize_simulation_state(state): 0},
             "wrap_indices": [],
             "cycle_start": None,
             "cycle_length": None,
+            "cycle_distance": None,
             "events": [],
             "channels": {},
         }
@@ -4204,6 +4683,7 @@ def sample_simulation_trajectory(scene, track_object, track_settings, frame):
 
     index = resolve_trajectory_index(cache, max(int(frame), 0))
     fronts = cache["fronts"]
+    travel_distances = cache["travel_distances"]
 
     if index >= len(fronts) and cache["cycle_length"] is None:
         derived = get_route_derived_data(route)
@@ -4214,13 +4694,17 @@ def sample_simulation_trajectory(scene, track_object, track_settings, frame):
         half_length = route["total_length"] * 0.5
         while len(fronts) <= index and len(fronts) <= TRAJECTORY_FRAME_LIMIT:
             previous_front = state["front"]
+            previous_speed = state["speed"]
+            previous_travel_distance = travel_distances[-1]
             step_events = []
             advance_simulation_state(state, route, derived, track_settings, delta_seconds, step_events)
+            next_travel_distance = previous_travel_distance + (previous_speed + state["speed"]) * 0.5 * delta_seconds
             quantized = quantize_simulation_state(state)
             seen_index = seen_states.get(quantized)
             if seen_index is not None:
                 cache["cycle_start"] = seen_index
                 cache["cycle_length"] = len(fronts) - seen_index
+                cache["cycle_distance"] = next_travel_distance - travel_distances[seen_index]
                 index = resolve_trajectory_index(cache, index)
                 break
             if step_events:
@@ -4231,6 +4715,7 @@ def sample_simulation_trajectory(scene, track_object, track_settings, frame):
             fronts.append(state["front"])
             cache["speeds"].append(state["speed"])
             cache["stops"].append(state["wait"])
+            travel_distances.append(next_travel_distance)
 
         if cache["cycle_length"] is None and len(fronts) > TRAJECTORY_FRAME_LIMIT:
             # No exact recurrence (e.g. a stopless free-running circuit):
@@ -4240,9 +4725,13 @@ def sample_simulation_trajectory(scene, track_object, track_settings, frame):
             if len(wrap_indices) >= 2:
                 cache["cycle_start"] = wrap_indices[-2]
                 cache["cycle_length"] = wrap_indices[-1] - wrap_indices[-2]
+                cache["cycle_distance"] = (
+                    travel_distances[wrap_indices[-1]] - travel_distances[wrap_indices[-2]]
+                )
             else:
                 cache["cycle_start"] = len(fronts) - 1
                 cache["cycle_length"] = 1
+                cache["cycle_distance"] = 0.0
             index = resolve_trajectory_index(cache, index)
 
     index = min(index, len(fronts) - 1)
@@ -4267,7 +4756,12 @@ def apply_simulation_frame(scene, track_object=None, track_settings=None):
         return
 
     front_distance, speed, stop_remaining = sample
+    travel_distance = resolve_trajectory_travel_distance(
+        SIMULATION_TRAJECTORY_CACHE,
+        max(int(round(scene.frame_current)), 0),
+    )
     assign_rna_property(track_settings, "train_front_route_meters", front_distance)
+    assign_rna_property(track_settings, "train_travel_distance_meters", max(travel_distance, 0.0))
     assign_rna_property(scene_settings, "simulation_current_speed_mps", speed)
     assign_rna_property(scene_settings, "simulation_stop_remaining_seconds", stop_remaining)
     place_track_followers(track_object, front_distance)
@@ -4350,6 +4844,12 @@ def track_settings_update(_settings, _context):
 
     owner = getattr(_settings, "id_data", None)
     if owner is not None and owner.type == "CURVE":
+        scene = getattr(bpy.context, "scene", None)
+        scene_settings = getattr(scene, "coaster_mixer_scene", None)
+        if scene_settings is None or not scene_settings.simulation_enabled:
+            travel_distance = max(owner.coaster_mixer_track.train_front_route_meters, 0.0)
+            if values_differ(owner.coaster_mixer_track.train_travel_distance_meters, travel_distance):
+                assign_rna_property(owner.coaster_mixer_track, "train_travel_distance_meters", travel_distance)
         tag_track_placement_update(owner)
     tag_redraw_view3d()
 
@@ -4362,6 +4862,8 @@ def driven_empty_object_update(settings, _context):
     owner = getattr(settings, "id_data", None)
     if owner is not None and owner.type == "CURVE" and settings.driven_empty_object is not None:
         ensure_driven_empty_path_setup(owner, settings)
+        if values_differ(settings.train_travel_distance_meters, max(settings.train_front_route_meters, 0.0)):
+            assign_rna_property(settings, "train_travel_distance_meters", max(settings.train_front_route_meters, 0.0))
     if bpy.context is not None:
         apply_simulation_frame(bpy.context.scene)
     tag_redraw_view3d()

@@ -300,7 +300,8 @@ def check_camera_rig(addon, track_object, scene_settings):
     camera_object = cameras[0]
     settings = camera_object.coaster_mixer_camera
     followers = addon.collect_track_followers(track_object)
-    assert settings.mount_object == followers[1], "camera should initially mount to the second car"
+    mounts = addon.collect_main_train_mounts(track_object)
+    assert settings.mount_object == mounts[1], "camera should initially mount to the second main train anchor"
     assert settings.target_object is not None, "camera target follower is missing"
     assert abs(settings.target_object.coaster_mixer_follower.vertical_offset_meters - 1.6) <= 1.0e-6
 
@@ -312,16 +313,19 @@ def check_camera_rig(addon, track_object, scene_settings):
     )
 
     settings.offset_xyz = (0.25, -0.1, 1.7)
-    settings.target_vertical_offset_meters = 1.7
+    settings.target_offset_xyz = (0.0, 0.0, 1.7)
+    settings.shake_enabled = False
+    addon.place_track_followers(track_object, 120.0)
+    unshaken_location = camera_object.location.copy()
     settings.shake_enabled = True
     scene_settings.simulation_current_speed_mps = 20.0
     addon.place_track_followers(track_object, 120.0)
-    assert (camera_object.location - Vector(settings.offset_xyz)).length > 1.0e-7, (
+    assert (camera_object.location - unshaken_location).length > 1.0e-7, (
         "enabled camera shake did not move the camera"
     )
     settings.shake_enabled = False
     addon.place_track_followers(track_object, 120.0)
-    assert (camera_object.location - Vector(settings.offset_xyz)).length <= 1.0e-7, (
+    assert (camera_object.location - unshaken_location).length <= 1.0e-7, (
         "disabled camera shake should restore the authored offset"
     )
 

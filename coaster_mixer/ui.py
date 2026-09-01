@@ -13,6 +13,12 @@ def is_sidebar_section_active(context, *section_ids):
     return scene_settings.sidebar_section in section_ids
 
 
+def draw_collapsible_section(layout, section_id, label, icon, default_closed=False):
+    header, body = layout.panel(section_id, default_closed=default_closed)
+    header.label(text=label, icon=icon)
+    return header, body
+
+
 def draw_zone_controls(layout, zone, total_length):
     _start_distance, end_distance = resolve_zone_span(zone)
 
@@ -297,7 +303,8 @@ def coaster_mixer_frame_change_handler(scene, _depsgraph=None):
         track_object = scene_settings.track_object
         if track_object is not None and track_object.type == "CURVE":
             # Baked playback animates the same front-distance property.
-            place_track_followers(track_object)
+            if not track_object.get(STANDALONE_BAKE_PROPERTY, False):
+                place_track_followers(track_object)
     tag_redraw_view3d()
 
 
@@ -343,6 +350,7 @@ def coaster_mixer_depsgraph_update_handler(_scene, depsgraph):
         PLACEMENT_SAMPLE_CACHE.clear()
         PLACEMENT_CHANNEL_CACHE.clear()
     sync_train_mount_bindings()
+    sync_wheel_spin_bindings()
 
 
 def ensure_depsgraph_update_handler():
@@ -373,6 +381,7 @@ def coaster_mixer_undo_redo_handler(_scene=None, _depsgraph=None):
     # Undo/redo restore property values without firing update callbacks, so
     # every derived cache (route zones, stop specs, trajectory) may be stale.
     invalidate_route_cache()
+    sync_wheel_spin_bindings()
     tag_redraw_view3d()
 
 
@@ -394,6 +403,7 @@ def coaster_mixer_load_post_handler(_filepath=None):
     # caches must not survive a file load.
     clear_runtime_caches()
     ensure_driver_namespace()
+    sync_wheel_spin_bindings()
 
 
 def ensure_load_post_handler():
@@ -660,82 +670,147 @@ class COASTERMIXER_PT_train(CoasterMixerPanelMixin, bpy.types.Panel):
         if track_settings is None:
             return
 
-        physics_box = layout.box()
-        physics_box.label(text="Physical Model", icon="PHYSICS")
-        column = physics_box.column()
-        column.use_property_split = True
-        column.use_property_decorate = False
-        column.prop(track_settings, "train_length_meters")
-        column.prop(track_settings, "train_weight_kilograms")
-        column.prop(track_settings, "friction_coefficient")
-        column.prop(track_settings, "drag_coefficient")
-        column.prop(track_settings, "frontal_area_m2")
-        rig_box = layout.box()
-        rig_box.label(text="Train Rig", icon="CONSTRAINT_BONE")
-        rig_column = rig_box.column()
-        rig_column.use_property_split = True
-        rig_column.use_property_decorate = False
-        rig_column.prop(track_settings, "train_rig_mode")
-        rig_column.prop(track_settings, "driven_empty_object")
-        rig_column.prop(track_settings, "train_mount_placement_mode")
-        rig_column.prop(track_settings, "train_mount_axis_preset")
-        rig_column.prop(track_settings, "train_mounts_reversed")
-        rig_column.prop(track_settings, "train_mount_vertical_offset_meters")
+        _physics_header, physics_box = draw_collapsible_section(
+            layout, "coaster_mixer_train_physics", "Physical Model", "PHYSICS", default_closed=True
+        )
+        if physics_box is not None:
+            column = physics_box.column()
+            column.use_property_split = True
+            column.use_property_decorate = False
+            column.prop(track_settings, "train_length_meters")
+            column.prop(track_settings, "train_weight_kilograms")
+            column.prop(track_settings, "friction_coefficient")
+            column.prop(track_settings, "drag_coefficient")
+            column.prop(track_settings, "frontal_area_m2")
 
-        if track_settings.driven_empty_object is not None:
-            rig_box.operator("coaster_mixer.setup_driven_empty", text="Attach Train Front Empty", icon="DRIVER")
-        rig_box.label(text=get_follower_setup_status(track_object, track_settings.driven_empty_object))
-        if track_settings.driven_empty_object is not None:
-            rig_box.label(text=f"Lead anchor: {track_settings.driven_empty_object.name} @ 0.00 m", icon="EMPTY_AXIS")
-            rig_box.label(text="Uses the same Car Mount Height as the rest of the train.", icon="INFO")
-        if track_settings.train_mount_placement_mode == "ARTICULATED":
-            rig_box.label(text="Trailing mounts solve coupler distance in world space on the mount path.", icon="CON_TRACKTO")
+        _rig_header, rig_box = draw_collapsible_section(
+            layout, "coaster_mixer_train_rig", "Train Rig", "CONSTRAINT_BONE"
+        )
+        if rig_box is not None:
+            rig_column = rig_box.column()
+            rig_column.use_property_split = True
+            rig_column.use_property_decorate = False
+            rig_column.prop(track_settings, "train_rig_mode")
+            rig_column.prop(track_settings, "driven_empty_object")
+            rig_column.prop(track_settings, "train_mount_placement_mode")
+            rig_column.prop(track_settings, "train_mount_axis_preset")
+            rig_column.prop(track_settings, "train_mounts_reversed")
+            rig_column.prop(track_settings, "train_mount_vertical_offset_meters")
 
-        follower_box = layout.box()
+            if track_settings.driven_empty_object is not None:
+                rig_box.operator("coaster_mixer.setup_driven_empty", text="Attach Train Front Empty", icon="DRIVER")
+            rig_box.label(text=get_follower_setup_status(track_object, track_settings.driven_empty_object))
+            if track_settings.driven_empty_object is not None:
+                rig_box.label(text=f"Lead anchor: {track_settings.driven_empty_object.name} @ 0.00 m", icon="EMPTY_AXIS")
+                rig_box.label(text="Uses the same Car Mount Height as the rest of the train.", icon="INFO")
+            if track_settings.train_mount_placement_mode == "ARTICULATED":
+                rig_box.label(text="Trailing mounts solve coupler distance in world space on the mount path.", icon="CON_TRACKTO")
+
         follower_label = "IK Targets" if track_settings.train_rig_mode == "IK_CHAIN" else "Car Mounts"
-        follower_box.label(text=follower_label, icon="LINKED")
+        _follower_header, follower_box = draw_collapsible_section(
+            layout, "coaster_mixer_train_mounts", follower_label, "LINKED"
+        )
         mounts = collect_track_followers(track_object)
-        if mounts:
-            for mount_index, follower_object in enumerate(mounts):
-                length_meters = get_train_mount_length_meters(mounts, mount_index)
-                role_identifier = getattr(follower_object.coaster_mixer_follower, "train_role", "MOUNT")
-                role_label = "IK Target" if role_identifier == "IK_TARGET" else "Mount"
-                row = follower_box.row(align=True)
-                row.label(text=f"{follower_object.name} ({role_label})", icon="EMPTY_AXIS")
-                edit = row.operator(
-                    "coaster_mixer.edit_train_mount_length",
-                    text=f"{length_meters:.2f} m",
-                    icon="DRIVER_DISTANCE",
-                )
-                edit.empty_name = follower_object.name
-                detach = row.operator("coaster_mixer.detach_follower", text="Remove", icon="X")
-                detach.empty_name = follower_object.name
-        else:
-            follower_box.label(text="No car mounts attached yet.")
-        button_row = follower_box.row(align=True)
-        button_row.operator(
-            "coaster_mixer.create_train_followers",
-            text="Add Car" if mounts else "Create Cars",
-            icon="OUTLINER_OB_EMPTY",
-        )
-        button_row.operator("coaster_mixer.attach_selected_followers", text="Attach Selected Empties", icon="LINKED")
-        follower_box.operator("coaster_mixer.attach_selected_ik_chain", text="Attach IK Chain Train", icon="CONSTRAINT_BONE")
+        if follower_box is not None:
+            if mounts:
+                for mount_index, follower_object in enumerate(mounts):
+                    length_meters = get_train_mount_length_meters(mounts, mount_index)
+                    role_identifier = getattr(follower_object.coaster_mixer_follower, "train_role", "MOUNT")
+                    role_label = "IK Target" if role_identifier == "IK_TARGET" else "Mount"
+                    row = follower_box.row(align=True)
+                    row.label(text=f"{follower_object.name} ({role_label})", icon="EMPTY_AXIS")
+                    edit = row.operator(
+                        "coaster_mixer.edit_train_mount_length",
+                        text=f"{length_meters:.2f} m",
+                        icon="DRIVER_DISTANCE",
+                    )
+                    edit.empty_name = follower_object.name
+                    detach = row.operator("coaster_mixer.detach_follower", text="Remove", icon="X")
+                    detach.empty_name = follower_object.name
+            else:
+                follower_box.label(text="No car mounts attached yet.")
+            button_row = follower_box.row(align=True)
+            button_row.operator(
+                "coaster_mixer.create_train_followers",
+                text="Add Car" if mounts else "Create Cars",
+                icon="OUTLINER_OB_EMPTY",
+            )
+            button_row.operator("coaster_mixer.attach_selected_followers", text="Attach Selected Empties", icon="LINKED")
+            follower_box.operator("coaster_mixer.attach_selected_ik_chain", text="Attach IK Chain Train", icon="CONSTRAINT_BONE")
 
-        wheelcarrier_box = layout.box()
-        wheelcarrier_box.label(text="Wheelcarrier Helpers", icon="EMPTY_AXIS")
-        wheelcarrier_column = wheelcarrier_box.column()
-        wheelcarrier_column.use_property_split = True
-        wheelcarrier_column.use_property_decorate = False
-        wheelcarrier_column.prop(track_settings, "wheelcarrier_lateral_offset_meters")
-        wheelcarrier_column.prop(track_settings, "wheelcarrier_longitudinal_offset_meters")
-        wheelcarrier_column.prop(track_settings, "wheelcarrier_vertical_offset_meters")
-        helper_count = len(collect_wheelcarrier_helpers(track_object))
-        wheelcarrier_box.label(text=f"{helper_count} helper empties bound to the train.", icon="INFO")
-        wheelcarrier_box.operator(
-            "coaster_mixer.create_wheelcarrier_helpers",
-            text="Create / Refresh Pairs",
-            icon="OUTLINER_OB_EMPTY",
+        _wheelcarrier_header, wheelcarrier_box = draw_collapsible_section(
+            layout, "coaster_mixer_train_wheelcarriers", "Wheelcarrier Helpers", "EMPTY_AXIS", default_closed=True
         )
+        if track_settings.wheelcarrier_helpers_enabled:
+            disable = _wheelcarrier_header.operator(
+                "coaster_mixer.toggle_wheelcarrier_helpers", text="", icon="HIDE_OFF"
+            )
+            disable.enable = False
+        else:
+            enable = _wheelcarrier_header.operator(
+                "coaster_mixer.toggle_wheelcarrier_helpers", text="", icon="HIDE_ON"
+            )
+            enable.enable = True
+        if wheelcarrier_box is not None:
+            if track_settings.wheelcarrier_helpers_enabled:
+                wheelcarrier_column = wheelcarrier_box.column()
+                wheelcarrier_column.use_property_split = True
+                wheelcarrier_column.use_property_decorate = False
+                wheelcarrier_column.prop(track_settings, "wheelcarrier_lateral_offset_meters")
+                wheelcarrier_column.prop(track_settings, "wheelcarrier_longitudinal_offset_meters")
+                wheelcarrier_column.prop(track_settings, "wheelcarrier_vertical_offset_meters")
+                helper_count = len(collect_wheelcarrier_helpers(track_object))
+                wheelcarrier_box.label(text=f"{helper_count} helper empties bound to the train.", icon="INFO")
+                wheelcarrier_box.operator(
+                    "coaster_mixer.create_wheelcarrier_helpers",
+                    text="Create / Refresh Pairs",
+                    icon="OUTLINER_OB_EMPTY",
+                )
+            else:
+                helper_count = len(collect_wheelcarrier_helpers(track_object))
+                if helper_count > 0:
+                    wheelcarrier_box.label(text=f"{helper_count} helper empties still exist and can be re-enabled.", icon="INFO")
+
+        wheel_spin_header, wheel_spin_box = draw_collapsible_section(
+            layout, "coaster_mixer_train_wheel_spin", "Wheel Spin Drivers", "DRIVER_ROTATIONAL_DIFFERENCE"
+        )
+        wheel_spin_header.operator("coaster_mixer.add_wheel_spin_binding", text="", icon="ADD")
+        if wheel_spin_box is not None and track_settings.wheel_spin_bindings:
+            for binding_index, binding in enumerate(track_settings.wheel_spin_bindings):
+                binding_box = wheel_spin_box.box()
+                binding_header = binding_box.row(align=True)
+                label_parts = []
+                if binding.armature_object is not None:
+                    label_parts.append(binding.armature_object.name)
+                if binding.bone_collection_name:
+                    label_parts.append(binding.bone_collection_name)
+                binding_header.label(text=" / ".join(label_parts) if label_parts else "Wheel Group", icon="ARMATURE_DATA")
+                duplicate = binding_header.operator(
+                    "coaster_mixer.duplicate_wheel_spin_binding",
+                    text="",
+                    icon="DUPLICATE",
+                )
+                duplicate.binding_index = binding_index
+                remove = binding_header.operator("coaster_mixer.remove_wheel_spin_binding", text="", icon="X")
+                remove.binding_index = binding_index
+                binding_column = binding_box.column()
+                binding_column.use_property_split = True
+                binding_column.use_property_decorate = False
+                binding_column.prop(binding, "armature_object")
+                if binding.armature_object is None:
+                    binding_box.label(text="Select an armature to create managed wheel-spin drivers.", icon="INFO")
+                else:
+                    binding_column.prop(binding, "bone_collection_name")
+                    if get_bone_collection_by_name(binding.armature_object, binding.bone_collection_name) is None:
+                        binding_box.label(text="Choose a bone collection to configure this binding.", icon="INFO")
+                    else:
+                        binding_column.prop(binding, "wheel_diameter_meters")
+                        binding_column.prop(binding, "rotation_axis")
+                        binding_column.prop(binding, "invert_rotation")
+                        wheel_bones = get_wheel_spin_pose_bones(binding.armature_object, binding.bone_collection_name)
+                        binding_box.label(text=f"Driving {len(wheel_bones)} wheel bone(s).", icon="BONE_DATA")
+        elif wheel_spin_box is not None:
+            wheel_spin_box.label(text="No wheel spin driver bindings yet.", icon="INFO")
 
 
 class COASTERMIXER_PT_camera(CoasterMixerPanelMixin, bpy.types.Panel):
@@ -755,7 +830,10 @@ class COASTERMIXER_PT_camera(CoasterMixerPanelMixin, bpy.types.Panel):
             layout.label(text="No ride camera created yet.")
         for camera_object in cameras:
             camera_box = layout.box()
-            camera_box.label(text=camera_object.name, icon="OUTLINER_OB_CAMERA")
+            camera_header = camera_box.row(align=True)
+            camera_header.label(text=camera_object.name, icon="OUTLINER_OB_CAMERA")
+            remove = camera_header.operator("coaster_mixer.remove_train_camera", text="", icon="X")
+            remove.camera_name = camera_object.name
             settings = camera_object.coaster_mixer_camera
             column = camera_box.column()
             column.use_property_split = True
@@ -764,19 +842,19 @@ class COASTERMIXER_PT_camera(CoasterMixerPanelMixin, bpy.types.Panel):
             column.prop(settings, "offset_xyz")
             column.prop(camera_object.data, "lens")
             column.prop(settings, "look_ahead_meters")
-            column.prop(settings, "target_vertical_offset_meters")
+            column.prop(settings, "target_offset_xyz")
             column.prop(settings, "shake_enabled")
-            shake_column = column.column()
-            shake_column.enabled = settings.shake_enabled
-            shake_column.prop(settings, "shake_factor")
-            shake_column.separator()
-            shake_column.label(text="Fine Vibration", icon="MOD_NOISE")
-            shake_column.prop(settings, "shake_vibration_millimeters")
-            shake_column.prop(settings, "shake_vibration_frequency")
-            shake_column.separator()
-            shake_column.label(text="Arm Motion", icon="CON_TRACKTO")
-            shake_column.prop(settings, "shake_motion_factor")
-            shake_column.prop(settings, "shake_motion_response_seconds")
+            if settings.shake_enabled:
+                shake_column = column.column()
+                shake_column.prop(settings, "shake_factor")
+                shake_column.separator()
+                shake_column.label(text="Fine Vibration", icon="MOD_NOISE")
+                shake_column.prop(settings, "shake_vibration_millimeters")
+                shake_column.prop(settings, "shake_vibration_frequency")
+                shake_column.separator()
+                shake_column.label(text="Arm Motion", icon="CON_TRACKTO")
+                shake_column.prop(settings, "shake_motion_factor")
+                shake_column.prop(settings, "shake_motion_response_seconds")
         layout.operator("coaster_mixer.create_train_camera", text="Create Ride Camera", icon="OUTLINER_OB_CAMERA")
 
 
@@ -822,18 +900,37 @@ class COASTERMIXER_PT_simulation(CoasterMixerPanelMixin, bpy.types.Panel):
             force_column.prop(scene_settings, "force_overlay_step_meters")
             force_column.prop(scene_settings, "force_overlay_scale_meters")
             force_column.prop(scene_settings, "force_overlay_max_g")
-        overlay_box.prop(scene_settings, "hide_overlays_while_playing")
+        if (
+            scene_settings.show_hardware_overlays
+            or scene_settings.show_block_overlays
+            or scene_settings.show_force_overlays
+            or scene_settings.show_control_overlays
+        ):
+            overlay_box.prop(scene_settings, "hide_overlays_while_playing")
 
         layout.operator("coaster_mixer.reset_simulation", icon="FILE_REFRESH")
         route = get_resolved_route(track_object)
-        metrics = get_simulation_overlay_metrics(
-            context.scene,
-            track_object,
-            track_settings,
-            route,
-            track_settings.train_front_route_meters,
-            scene_settings.simulation_current_speed_mps,
-        )
+        if track_object.get(STANDALONE_BAKE_PROPERTY, False):
+            baked_front = track_settings.train_front_route_meters
+            metrics = {
+                "front_meters": baked_front,
+                "wrapped_front_meters": wrap_route_distance(route, baked_front),
+                "speed_mps": float(context.scene.get("cm_baked_speed_mps", 0.0)),
+                "speed_kmh": float(context.scene.get("cm_baked_speed_mps", 0.0)) * 3.6,
+                "lateral_g_signed": float(context.scene.get("cm_baked_lateral_g", 0.0)),
+                "vertical_g_signed": float(context.scene.get("cm_baked_vertical_g", 0.0)),
+                "longitudinal_g_signed": float(context.scene.get("cm_baked_longitudinal_g", 0.0)),
+                "total_g": float(context.scene.get("cm_baked_total_g", 0.0)),
+            }
+        else:
+            metrics = get_simulation_overlay_metrics(
+                context.scene,
+                track_object,
+                track_settings,
+                route,
+                track_settings.train_front_route_meters,
+                scene_settings.simulation_current_speed_mps,
+            )
         if metrics is not None:
             stats_box = layout.box()
             stats_box.label(text="Live Metrics", icon="DRIVER")

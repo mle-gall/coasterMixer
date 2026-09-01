@@ -681,6 +681,15 @@ def camera_settings_update(settings, _context):
         target_settings = target_object.coaster_mixer_follower
         if target_settings.track_object != settings.track_object:
             assign_rna_property(target_settings, "track_object", settings.track_object)
+        desired_source_mount = (
+            mount_object
+            if mount_object is not None
+            and mount_object.type == "EMPTY"
+            and mount_object.coaster_mixer_follower.track_object == settings.track_object
+            else None
+        )
+        if target_settings.source_mount_object != desired_source_mount:
+            assign_rna_property(target_settings, "source_mount_object", desired_source_mount)
         mount_offset = (
             mount_object.coaster_mixer_follower.offset_meters
             if mount_object is not None
@@ -691,11 +700,12 @@ def camera_settings_update(settings, _context):
         desired_offset = mount_offset - settings.look_ahead_meters
         if values_differ(target_settings.offset_meters, desired_offset):
             assign_rna_property(target_settings, "offset_meters", desired_offset)
-        if values_differ(target_settings.vertical_offset_meters, settings.target_vertical_offset_meters):
+        target_offset = Vector(settings.target_offset_xyz)
+        if values_differ(target_settings.vertical_offset_meters, target_offset.z):
             assign_rna_property(
                 target_settings,
                 "vertical_offset_meters",
-                settings.target_vertical_offset_meters,
+                target_offset.z,
             )
     track_object = settings.track_object
     if track_object is not None and track_object.type == "CURVE":
@@ -742,11 +752,12 @@ class CoasterMixerCameraSettings(bpy.types.PropertyGroup):
         default=5.0,
         update=camera_settings_update,
     )
-    target_vertical_offset_meters: bpy.props.FloatProperty(
-        name="Target Height",
-        description="Local height of the look-ahead follower so the camera aims horizontally at equal offsets",
-        subtype="DISTANCE",
-        default=1.6,
+    target_offset_xyz: bpy.props.FloatVectorProperty(
+        name="Target Offset",
+        description="Local offset of the look-ahead helper in the mounted follower's local XYZ axes",
+        subtype="TRANSLATION",
+        size=3,
+        default=(0.0, 0.0, 1.6),
         update=camera_settings_update,
     )
     shake_enabled: bpy.props.BoolProperty(
@@ -804,10 +815,59 @@ class CoasterMixerCameraSettings(bpy.types.PropertyGroup):
     )
 
 
+class CoasterMixerWheelSpinBinding(bpy.types.PropertyGroup):
+    binding_key: bpy.props.StringProperty(
+        name="Binding Key",
+        default="",
+    )
+    armature_object: bpy.props.PointerProperty(
+        name="Armature",
+        description="Armature containing the wheel bones to drive",
+        type=bpy.types.Object,
+        poll=is_armature_object,
+        update=wheel_spin_binding_update,
+    )
+    bone_collection_name: bpy.props.EnumProperty(
+        name="Bone Collection",
+        description="Bone collection containing one wheel bone per wheel",
+        items=get_armature_bone_collection_items,
+        update=wheel_spin_binding_update,
+    )
+    wheel_diameter_meters: bpy.props.FloatProperty(
+        name="Wheel Diameter",
+        description="Physical wheel diameter used to convert traveled distance into spin angle",
+        min=0.001,
+        subtype="DISTANCE",
+        default=0.6,
+        precision=4,
+        update=wheel_spin_binding_update,
+    )
+    rotation_axis: bpy.props.EnumProperty(
+        name="Axis",
+        description="Local Euler axis to drive on each wheel bone",
+        items=WHEEL_SPIN_AXIS_ITEMS,
+        default="X",
+        update=wheel_spin_binding_update,
+    )
+    invert_rotation: bpy.props.BoolProperty(
+        name="Invert",
+        description="Reverse the driven rotation direction for mirrored wheel sets",
+        default=False,
+        update=wheel_spin_binding_update,
+    )
+
+
 class CoasterMixerTrackSettings(bpy.types.PropertyGroup):
     zones: bpy.props.CollectionProperty(type=CoasterMixerZone)
     sensors: bpy.props.CollectionProperty(type=CoasterMixerSensor)
     block_groups: bpy.props.CollectionProperty(type=CoasterMixerBlockGroup)
+    wheel_spin_bindings: bpy.props.CollectionProperty(type=CoasterMixerWheelSpinBinding)
+    active_wheel_spin_binding_index: bpy.props.IntProperty(
+        name="Active Wheel Spin Binding",
+        min=0,
+        default=0,
+        update=track_settings_update,
+    )
     orientation_frame_mode: bpy.props.EnumProperty(
         name="Orientation Frame",
         description="How follower up orientation is carried along this curve piece",
@@ -886,6 +946,12 @@ class CoasterMixerTrackSettings(bpy.types.PropertyGroup):
         default=0.0,
         update=track_settings_update,
     )
+    wheelcarrier_helpers_enabled: bpy.props.BoolProperty(
+        name="Wheelcarrier Helpers",
+        description="Enable symmetric wheelcarrier helper empties bound to the train",
+        default=True,
+        update=track_settings_update,
+    )
     wheelcarrier_lateral_offset_meters: bpy.props.FloatProperty(
         name="Wheelcarrier Lateral",
         description="Symmetric lateral offset from each main train empty to the left and right wheelcarrier helpers",
@@ -915,6 +981,14 @@ class CoasterMixerTrackSettings(bpy.types.PropertyGroup):
         default=0.0,
         precision=3,
         update=track_settings_update,
+    )
+    train_travel_distance_meters: bpy.props.FloatProperty(
+        name="Train Travel",
+        description="Cumulative traveled distance used by managed wheel-spin drivers",
+        min=0.0,
+        subtype="DISTANCE",
+        default=0.0,
+        precision=4,
     )
     start_connections: bpy.props.CollectionProperty(type=CoasterMixerConnection)
     start_active_index: bpy.props.IntProperty(

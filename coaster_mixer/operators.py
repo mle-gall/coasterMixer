@@ -816,9 +816,12 @@ class COASTERMIXER_OT_attach_selected_followers(bpy.types.Operator):
         mount_lengths = import_layout["mount_lengths"]
         added_length = import_layout["total_length"]
 
-        mounts = collect_track_followers(track_object) if track_object is not None else []
-        current_total_length = get_train_mount_total_length_meters(mounts)
-        proposed_total_length = current_total_length + added_length
+        current_total_length = (
+            self._preview_state["mount_total_length"]
+            if getattr(self, "_preview_state", None) is not None
+            else (get_train_mount_total_length_meters(collect_track_followers(track_object)) if track_object is not None else 0.0)
+        )
+        proposed_total_length = added_length
 
         column = layout.column()
         column.use_property_split = True
@@ -977,8 +980,12 @@ class COASTERMIXER_OT_attach_selected_ik_chain(bpy.types.Operator):
         mount_lengths = import_layout["mount_lengths"]
         orientation_check = import_layout["orientation_check"]
 
-        current_total_length = get_train_mount_total_length_meters(collect_track_followers(track_object)) if track_object is not None else 0.0
-        proposed_total_length = current_total_length + import_layout["total_length"]
+        current_total_length = (
+            self._preview_state["mount_total_length"]
+            if getattr(self, "_preview_state", None) is not None
+            else (get_train_mount_total_length_meters(collect_track_followers(track_object)) if track_object is not None else 0.0)
+        )
+        proposed_total_length = import_layout["total_length"]
 
         column = layout.column()
         column.use_property_split = True
@@ -1225,6 +1232,8 @@ def capture_attach_preview_state(context):
         "train_rig_mode": track_settings.train_rig_mode,
         "train_mount_axis_preset": track_settings.train_mount_axis_preset,
         "train_mounts_reversed": track_settings.train_mounts_reversed,
+        "train_length_meters": track_settings.train_length_meters,
+        "mount_total_length": get_train_mount_total_length_meters(collect_track_followers(track_object)),
         "objects": [capture_attach_preview_object_state(object_ref) for object_ref in unique_objects],
     }
 
@@ -1240,6 +1249,7 @@ def restore_attach_preview_state(snapshot):
     assign_rna_property(track_settings, "train_rig_mode", snapshot["train_rig_mode"])
     assign_rna_property(track_settings, "train_mount_axis_preset", snapshot["train_mount_axis_preset"])
     assign_rna_property(track_settings, "train_mounts_reversed", snapshot["train_mounts_reversed"])
+    assign_rna_property(track_settings, "train_length_meters", snapshot["train_length_meters"])
     for object_snapshot in snapshot["objects"]:
         restore_attach_preview_object_state(object_snapshot)
     place_track_followers(track_object)
@@ -1652,7 +1662,8 @@ class COASTERMIXER_OT_create_train_followers(bpy.types.Operator):
             self.report({"WARNING"}, "Select a curve object first")
             return {"CANCELLED"}
 
-        ensure_train_front_empty(track_object, track_settings, context.collection)
+        generated_collection = get_generated_track_collection(track_object, "Train Rig")
+        ensure_train_front_empty(track_object, track_settings, generated_collection)
         assign_rna_property(track_settings, "train_rig_mode", "STANDARD")
         mounts = collect_track_followers(track_object)
         base_offset = get_train_mount_total_length_meters(mounts)
@@ -1661,7 +1672,7 @@ class COASTERMIXER_OT_create_train_followers(bpy.types.Operator):
             empty_object = bpy.data.objects.new(f"{track_object.name} Car {car_index + 1:02d}", None)
             empty_object.empty_display_type = "PLAIN_AXES"
             empty_object.empty_display_size = 0.5
-            context.collection.objects.link(empty_object)
+            generated_collection.objects.link(empty_object)
             ensure_follower_drivers(track_object, empty_object, offset_meters=offset_meters)
             mark_train_mount(empty_object)
 
@@ -1737,13 +1748,14 @@ class COASTERMIXER_OT_create_train_camera(bpy.types.Operator):
         target_object.empty_display_type = "PLAIN_AXES"
         target_object.empty_display_size = 0.25
         target_object["coaster_mixer_camera_target"] = True
-        context.collection.objects.link(target_object)
+        camera_collection = get_generated_track_collection(track_object, "Cameras")
+        camera_collection.objects.link(target_object)
         ensure_follower_drivers(track_object, target_object, offset_meters=-self.look_ahead_meters)
 
         camera_data = bpy.data.cameras.new(f"{track_object.name} Ride Camera")
         camera_data.lens = self.lens_millimeters
         camera_object = bpy.data.objects.new(camera_data.name, camera_data)
-        context.collection.objects.link(camera_object)
+        camera_collection.objects.link(camera_object)
         camera_object.parent = mount_object
         camera_object.location = (0.0, 0.0, self.height_meters)
         camera_object.rotation_euler = (0.0, 0.0, 0.0)
@@ -1761,7 +1773,8 @@ class COASTERMIXER_OT_create_train_camera(bpy.types.Operator):
         camera_settings.target_object = target_object
         camera_settings.offset_xyz = (0.0, 0.0, self.height_meters)
         camera_settings.look_ahead_meters = self.look_ahead_meters
-        camera_settings.target_vertical_offset_meters = self.height_meters
+        camera_settings.target_offset_xyz = (0.0, 0.0, self.height_meters)
+        target_object.coaster_mixer_follower.source_mount_object = mount_object
 
         if self.make_active:
             context.scene.camera = camera_object
@@ -1771,6 +1784,209 @@ class COASTERMIXER_OT_create_train_camera(bpy.types.Operator):
         tag_redraw_view3d()
         self.report({"INFO"}, f"Created ride camera above {mount_object.name}")
         return {"FINISHED"}
+
+
+class COASTERMIXER_OT_remove_train_camera(bpy.types.Operator):
+    bl_idname = "coaster_mixer.remove_train_camera"
+    bl_label = "Delete Ride Camera"
+    bl_description = "Delete this ride camera and its managed look-ahead helper"
+    bl_options = {"REGISTER", "UNDO"}
+
+    camera_name: bpy.props.StringProperty(name="Camera")
+
+    @classmethod
+    def poll(cls, context):
+        return resolve_active_track_object(context) is not None
+
+    def execute(self, context):
+        track_object = resolve_active_track_object(context)
+        camera_object = bpy.data.objects.get(self.camera_name)
+        if camera_object is None or camera_object.type != "CAMERA":
+            self.report({"WARNING"}, "Ride camera is no longer available")
+            return {"CANCELLED"}
+        camera_settings = getattr(camera_object, "coaster_mixer_camera", None)
+        if camera_settings is None or camera_settings.track_object != track_object:
+            self.report({"WARNING"}, "Camera does not belong to the active coaster")
+            return {"CANCELLED"}
+
+        target_object = camera_settings.target_object
+        camera_data = camera_object.data
+        bpy.data.objects.remove(camera_object, do_unlink=True)
+
+        if (
+            target_object is not None
+            and target_object.type == "EMPTY"
+            and target_object.get("coaster_mixer_camera_target", False)
+            and bpy.data.objects.get(target_object.name) is not None
+            and get_camera_target_owner(track_object, target_object) is None
+        ):
+            remove_follower_drivers(target_object)
+            bpy.data.objects.remove(target_object, do_unlink=True)
+
+        if camera_data is not None and camera_data.users == 0:
+            bpy.data.cameras.remove(camera_data)
+        tag_redraw_view3d()
+        self.report({"INFO"}, "Deleted ride camera")
+        return {"FINISHED"}
+
+
+class COASTERMIXER_OT_add_wheel_spin_binding(bpy.types.Operator):
+    bl_idname = "coaster_mixer.add_wheel_spin_binding"
+    bl_label = "Add Wheel Spin Driver"
+    bl_description = "Add a managed wheel-spin driver binding for a wheel bone collection"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        track_object, _track_settings = resolve_active_track_settings(context)
+        return track_object is not None
+
+    def execute(self, context):
+        track_object, track_settings = resolve_active_track_settings(context)
+        if track_object is None or track_settings is None:
+            return {"CANCELLED"}
+
+        binding = track_settings.wheel_spin_bindings.add()
+        binding.binding_key = generate_wheel_spin_binding_key()
+
+        active_object = getattr(context.view_layer.objects, "active", None)
+        if active_object is not None and active_object.type == "ARMATURE":
+            binding.armature_object = active_object
+            collection_items = get_armature_bone_collection_items(binding, context)
+            if collection_items and collection_items[0][0]:
+                binding.bone_collection_name = collection_items[0][0]
+
+        track_settings.active_wheel_spin_binding_index = len(track_settings.wheel_spin_bindings) - 1
+        sync_wheel_spin_bindings()
+        tag_redraw_view3d()
+        self.report({"INFO"}, "Added wheel spin driver binding")
+        return {"FINISHED"}
+
+
+class COASTERMIXER_OT_duplicate_wheel_spin_binding(bpy.types.Operator):
+    bl_idname = "coaster_mixer.duplicate_wheel_spin_binding"
+    bl_label = "Duplicate Wheel Spin Driver"
+    bl_description = "Duplicate this wheel setup so it can be assigned to another bone collection"
+    bl_options = {"REGISTER", "UNDO"}
+
+    binding_index: bpy.props.IntProperty(name="Binding Index", min=0, default=0)
+
+    @classmethod
+    def poll(cls, context):
+        track_object, track_settings = resolve_active_track_settings(context)
+        return track_object is not None and track_settings is not None
+
+    def execute(self, context):
+        _track_object, track_settings = resolve_active_track_settings(context)
+        if track_settings is None:
+            return {"CANCELLED"}
+        if self.binding_index < 0 or self.binding_index >= len(track_settings.wheel_spin_bindings):
+            self.report({"WARNING"}, "Wheel spin binding is no longer available")
+            return {"CANCELLED"}
+
+        source = track_settings.wheel_spin_bindings[self.binding_index]
+        source_values = {
+            "armature_object": source.armature_object,
+            "bone_collection_name": source.bone_collection_name,
+            "wheel_diameter_meters": source.wheel_diameter_meters,
+            "rotation_axis": source.rotation_axis,
+            "invert_rotation": source.invert_rotation,
+        }
+        duplicate = track_settings.wheel_spin_bindings.add()
+        duplicate.binding_key = generate_wheel_spin_binding_key()
+        for attribute, value in source_values.items():
+            if attribute == "bone_collection_name" and not value:
+                continue
+            setattr(duplicate, attribute, value)
+
+        track_settings.active_wheel_spin_binding_index = len(track_settings.wheel_spin_bindings) - 1
+        sync_wheel_spin_bindings()
+        tag_redraw_view3d()
+        self.report({"INFO"}, "Duplicated wheel spin driver binding")
+        return {"FINISHED"}
+
+
+class COASTERMIXER_OT_remove_wheel_spin_binding(bpy.types.Operator):
+    bl_idname = "coaster_mixer.remove_wheel_spin_binding"
+    bl_label = "Remove Wheel Spin Driver"
+    bl_description = "Remove this managed wheel-spin driver binding and clean up its bone drivers"
+    bl_options = {"REGISTER", "UNDO"}
+
+    binding_index: bpy.props.IntProperty(name="Binding Index", min=0, default=0)
+
+    @classmethod
+    def poll(cls, context):
+        track_object, _track_settings = resolve_active_track_settings(context)
+        return track_object is not None
+
+    def execute(self, context):
+        track_object, track_settings = resolve_active_track_settings(context)
+        if track_object is None or track_settings is None:
+            return {"CANCELLED"}
+        if self.binding_index < 0 or self.binding_index >= len(track_settings.wheel_spin_bindings):
+            self.report({"WARNING"}, "Wheel spin binding is no longer available")
+            return {"CANCELLED"}
+
+        track_settings.wheel_spin_bindings.remove(self.binding_index)
+        track_settings.active_wheel_spin_binding_index = clamp(
+            track_settings.active_wheel_spin_binding_index,
+            0,
+            max(len(track_settings.wheel_spin_bindings) - 1, 0),
+        )
+        sync_wheel_spin_bindings()
+        tag_redraw_view3d()
+        self.report({"INFO"}, "Removed wheel spin driver binding")
+        return {"FINISHED"}
+
+
+def create_or_refresh_wheelcarrier_helpers(track_object, target_collection):
+    mounts = collect_main_train_mounts(track_object)
+    if not mounts:
+        return 0, 0
+
+    created_count = 0
+    refreshed_count = 0
+    for mount_object in mounts:
+        existing_helpers = {
+            helper_object.get("coaster_mixer_wheelcarrier_side", ""): helper_object
+            for helper_object in get_bound_wheelcarrier_helpers(mount_object)
+        }
+        for side_identifier, side_label in (("L", "Left"), ("R", "Right")):
+            helper_object = existing_helpers.get(side_identifier)
+            if helper_object is None:
+                helper_object = bpy.data.objects.new(f"{mount_object.name} Wheelcarrier {side_label}", None)
+                helper_object.empty_display_type = "PLAIN_AXES"
+                helper_object.empty_display_size = 0.2
+                target_collection.objects.link(helper_object)
+                created_count += 1
+            else:
+                refreshed_count += 1
+            helper_object["coaster_mixer_wheelcarrier_helper"] = True
+            helper_object["coaster_mixer_wheelcarrier_side"] = side_identifier
+            helper_object.coaster_mixer_follower.source_mount_object = mount_object
+            helper_object.coaster_mixer_follower.reverse_forward_axis = mount_object.coaster_mixer_follower.reverse_forward_axis
+            ensure_follower_drivers(track_object, helper_object, offset_meters=0.0)
+    return created_count, refreshed_count
+
+
+def get_wheelcarrier_helper_reference_count(track_object):
+    return sum(len(helper_object.children) for helper_object in collect_wheelcarrier_helpers(track_object))
+
+
+def disable_wheelcarrier_helpers(track_object):
+    removed_count = 0
+    detached_count = 0
+    for helper_object in list(collect_wheelcarrier_helpers(track_object)):
+        if helper_object.children:
+            remove_follower_drivers(helper_object)
+            helper_object.pop("coaster_mixer_wheelcarrier_helper", None)
+            helper_object.pop("coaster_mixer_wheelcarrier_side", None)
+            helper_object.coaster_mixer_follower.source_mount_object = None
+            detached_count += 1
+            continue
+        remove_object_hierarchy(helper_object)
+        removed_count += 1
+    return removed_count, detached_count
 
 
 class COASTERMIXER_OT_create_wheelcarrier_helpers(bpy.types.Operator):
@@ -1785,39 +2001,80 @@ class COASTERMIXER_OT_create_wheelcarrier_helpers(bpy.types.Operator):
         return track_object is not None and len(collect_main_train_mounts(track_object)) > 0
 
     def execute(self, context):
-        track_object, _track_settings = resolve_active_track_settings(context)
+        track_object, track_settings = resolve_active_track_settings(context)
         mounts = collect_main_train_mounts(track_object)
         if not mounts:
             self.report({"WARNING"}, "Create or attach at least one main train empty first")
             return {"CANCELLED"}
 
-        target_collection = context.collection if context.collection is not None else get_default_track_object_collection(track_object)
-        created_count = 0
-        refreshed_count = 0
-        for mount_object in mounts:
-            existing_helpers = {
-                helper_object.get("coaster_mixer_wheelcarrier_side", ""): helper_object
-                for helper_object in get_bound_wheelcarrier_helpers(mount_object)
-            }
-            for side_identifier, side_label in (("L", "Left"), ("R", "Right")):
-                helper_object = existing_helpers.get(side_identifier)
-                if helper_object is None:
-                    helper_object = bpy.data.objects.new(f"{mount_object.name} Wheelcarrier {side_label}", None)
-                    helper_object.empty_display_type = "PLAIN_AXES"
-                    helper_object.empty_display_size = 0.2
-                    target_collection.objects.link(helper_object)
-                    created_count += 1
-                else:
-                    refreshed_count += 1
-                helper_object["coaster_mixer_wheelcarrier_helper"] = True
-                helper_object["coaster_mixer_wheelcarrier_side"] = side_identifier
-                helper_object.coaster_mixer_follower.source_mount_object = mount_object
-                helper_object.coaster_mixer_follower.reverse_forward_axis = mount_object.coaster_mixer_follower.reverse_forward_axis
-                ensure_follower_drivers(track_object, helper_object, offset_meters=0.0)
+        target_collection = get_generated_track_collection(track_object, "Wheelcarriers")
+        track_settings.wheelcarrier_helpers_enabled = True
+        created_count, refreshed_count = create_or_refresh_wheelcarrier_helpers(track_object, target_collection)
 
         tag_track_placement_update(track_object)
         tag_redraw_view3d()
         self.report({"INFO"}, f"Created {created_count} and refreshed {refreshed_count} wheelcarrier helpers")
+        return {"FINISHED"}
+
+
+class COASTERMIXER_OT_toggle_wheelcarrier_helpers(bpy.types.Operator):
+    bl_idname = "coaster_mixer.toggle_wheelcarrier_helpers"
+    bl_label = "Toggle Wheelcarrier Helpers"
+    bl_description = "Enable or disable wheelcarrier helper empties for the current train"
+    bl_options = {"REGISTER", "UNDO"}
+
+    enable: bpy.props.BoolProperty(name="Enable", default=True)
+    detach_referenced: bpy.props.BoolProperty(
+        name="Detach Referenced Helpers",
+        description="Disable wheelcarrier helpers even when other objects are still parented to them",
+        default=False,
+    )
+
+    @classmethod
+    def poll(cls, context):
+        track_object, _track_settings = resolve_active_track_settings(context)
+        return track_object is not None
+
+    def invoke(self, context, _event):
+        track_object, _track_settings = resolve_active_track_settings(context)
+        if self.enable or track_object is None:
+            return self.execute(context)
+        if get_wheelcarrier_helper_reference_count(track_object) > 0:
+            return context.window_manager.invoke_props_dialog(self, width=420)
+        return self.execute(context)
+
+    def draw(self, context):
+        layout = self.layout
+        track_object, _track_settings = resolve_active_track_settings(context)
+        reference_count = get_wheelcarrier_helper_reference_count(track_object) if track_object is not None else 0
+        layout.label(text=f"{reference_count} child object(s) are still parented to wheelcarrier helpers.", icon="ERROR")
+        layout.label(text="Disabling will detach those helpers from Coaster Mixer and keep them as regular empties.")
+        layout.prop(self, "detach_referenced")
+
+    def execute(self, context):
+        track_object, track_settings = resolve_active_track_settings(context)
+        if track_object is None or track_settings is None:
+            return {"CANCELLED"}
+
+        if self.enable:
+            target_collection = get_generated_track_collection(track_object, "Wheelcarriers")
+            track_settings.wheelcarrier_helpers_enabled = True
+            created_count, refreshed_count = create_or_refresh_wheelcarrier_helpers(track_object, target_collection)
+            tag_track_placement_update(track_object)
+            tag_redraw_view3d()
+            self.report({"INFO"}, f"Enabled wheelcarrier helpers ({created_count} created, {refreshed_count} refreshed)")
+            return {"FINISHED"}
+
+        reference_count = get_wheelcarrier_helper_reference_count(track_object)
+        if reference_count > 0 and not self.detach_referenced:
+            self.report({"WARNING"}, "Wheelcarrier helpers still have child objects; confirm detaching them first")
+            return {"CANCELLED"}
+
+        removed_count, detached_count = disable_wheelcarrier_helpers(track_object)
+        track_settings.wheelcarrier_helpers_enabled = False
+        tag_track_placement_update(track_object)
+        tag_redraw_view3d()
+        self.report({"INFO"}, f"Disabled wheelcarrier helpers ({removed_count} removed, {detached_count} detached)")
         return {"FINISHED"}
 
 
@@ -1914,7 +2171,7 @@ class COASTERMIXER_OT_reset_simulation(bpy.types.Operator):
 class COASTERMIXER_OT_bake_simulation(bpy.types.Operator):
     bl_idname = "coaster_mixer.bake_simulation"
     bl_label = "Bake Simulation"
-    bl_description = "Bake the simulated path factor to keyframes on the active track"
+    bl_description = "Bake standalone train, wheel, camera, and metric animation that plays without the add-on"
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
@@ -1937,9 +2194,38 @@ class COASTERMIXER_OT_bake_simulation(bpy.types.Operator):
 
         window_manager = context.window_manager
         bake_started = perf_counter()
+        original_frame = scene.frame_current
         try:
-            # The trajectory is read-only, so baking is just writing the same
-            # samples live playback shows to keyframes.
+            if track_object.get(STANDALONE_BAKE_PROPERTY, False):
+                clear_standalone_visual_bake(track_object)
+            placement_objects = list(collect_track_placement_objects(track_object))
+            placement_objects.extend(collect_ride_cameras(track_object))
+            placement_objects = list(dict.fromkeys(placement_objects))
+            object_samples = {
+                object_ref: {path: [[] for _axis in range(3)] for path in ("location", "rotation_euler")}
+                for object_ref in placement_objects
+            }
+            wheel_samples = []
+            for binding in get_track_wheel_spin_bindings(track_object):
+                armature_object = binding.armature_object
+                axis_index = get_wheel_spin_axis_index(binding.rotation_axis)
+                direction_sign = -1.0 if binding.invert_rotation else 1.0
+                radians_per_meter = (
+                    2.0 / max(binding.wheel_diameter_meters, 1.0e-6) * direction_sign
+                )
+                for pose_bone in get_wheel_spin_pose_bones(armature_object, binding.bone_collection_name):
+                    wheel_samples.append(
+                        (armature_object, pose_bone, axis_index, radians_per_meter, [])
+                    )
+            metric_samples = {
+                "cm_baked_speed_mps": [],
+                "cm_baked_lateral_g": [],
+                "cm_baked_vertical_g": [],
+                "cm_baked_longitudinal_g": [],
+                "cm_baked_total_g": [],
+            }
+            travel_values = []
+            route = get_resolved_route(track_object)
             window_manager.progress_begin(frame_start, frame_end)
             frame_values = []
             for frame in range(frame_start, frame_end + 1):
@@ -1947,7 +2233,32 @@ class COASTERMIXER_OT_bake_simulation(bpy.types.Operator):
                 if sample is None:
                     self.report({"WARNING"}, "The route is empty; nothing to bake")
                     return {"CANCELLED"}
-                frame_values.append((frame, sample[0]))
+                front_meters, speed_mps, _stop_remaining = sample
+                travel_meters = sample_simulation_travel_distance(
+                    scene, track_object, track_settings, frame
+                )
+                frame_values.append((frame, front_meters))
+                travel_values.append((frame, travel_meters))
+                assign_rna_property(track_settings, "train_front_route_meters", front_meters)
+                assign_rna_property(track_settings, "train_travel_distance_meters", travel_meters)
+                assign_rna_property(scene_settings, "simulation_current_speed_mps", speed_mps)
+                place_track_followers(track_object, front_meters)
+                for object_ref, paths in object_samples.items():
+                    for data_path in ("location", "rotation_euler"):
+                        value = getattr(object_ref, data_path)
+                        for axis_index in range(3):
+                            paths[data_path][axis_index].append((frame, value[axis_index]))
+                for _armature, _pose_bone, _axis_index, radians_per_meter, values in wheel_samples:
+                    values.append((frame, travel_meters * radians_per_meter))
+                metrics = get_simulation_overlay_metrics(
+                    scene, track_object, track_settings, route, front_meters, speed_mps
+                )
+                metric_samples["cm_baked_speed_mps"].append((frame, speed_mps))
+                if metrics is not None:
+                    metric_samples["cm_baked_lateral_g"].append((frame, metrics["lateral_g_signed"]))
+                    metric_samples["cm_baked_vertical_g"].append((frame, metrics["vertical_g_signed"]))
+                    metric_samples["cm_baked_longitudinal_g"].append((frame, metrics["longitudinal_g_signed"]))
+                    metric_samples["cm_baked_total_g"].append((frame, metrics["total_g"]))
                 if frame % 32 == 0:
                     window_manager.progress_update(frame)
 
@@ -1962,9 +2273,31 @@ class COASTERMIXER_OT_bake_simulation(bpy.types.Operator):
                 baked_curve = get_action_fcurve(track_object, TRAIN_FRONT_METERS_DATA_PATH)
                 set_fcurve_linear(baked_curve)
 
+            clear_action_fcurve(track_object, TRAIN_TRAVEL_DISTANCE_DATA_PATH)
+            insert_dense_fcurve_keyframes(track_object, TRAIN_TRAVEL_DISTANCE_DATA_PATH, travel_values)
+            track_object[STANDALONE_BAKE_PROPERTY] = True
+            for object_ref, paths in object_samples.items():
+                object_ref[STANDALONE_BAKE_TRACK_PROPERTY] = track_object.name
+                for data_path, axes in paths.items():
+                    for axis_index, values in enumerate(axes):
+                        insert_dense_indexed_fcurve_keyframes(
+                            object_ref, data_path, axis_index, values
+                        )
+            for armature_object, pose_bone, axis_index, _radians_per_meter, values in wheel_samples:
+                remove_wheel_spin_driver_axis(armature_object, pose_bone, axis_index)
+                insert_dense_indexed_fcurve_keyframes(
+                    armature_object,
+                    get_wheel_spin_bone_data_path(pose_bone),
+                    axis_index,
+                    values,
+                )
+            for property_name, values in metric_samples.items():
+                scene[property_name] = values[0][1] if values else 0.0
+                insert_dense_fcurve_keyframes(scene, f'["{property_name}"]', values)
+
             self.place_trigger_markers(scene, frame_start, frame_end)
             assign_simulation_enabled(scene_settings, False)
-            scene.frame_set(scene.frame_current)
+            scene.frame_set(original_frame)
         except Exception as exc:
             self.report({"ERROR"}, f"Simulation bake failed: {exc}")
             return {"CANCELLED"}
@@ -1975,7 +2308,7 @@ class COASTERMIXER_OT_bake_simulation(bpy.types.Operator):
         bake_seconds = perf_counter() - bake_started
         self.report(
             {"INFO"},
-            f"Baked {baked_frame_count} frames in {bake_seconds:.2f}s and disabled runtime simulation",
+            f"Baked {baked_frame_count} standalone frames in {bake_seconds:.2f}s and disabled runtime simulation",
         )
         tag_redraw_view3d()
         return {"FINISHED"}
@@ -2004,7 +2337,7 @@ class COASTERMIXER_OT_bake_simulation(bpy.types.Operator):
 class COASTERMIXER_OT_clear_baked_simulation(bpy.types.Operator):
     bl_idname = "coaster_mixer.clear_baked_simulation"
     bl_label = "Clear Baked Keys"
-    bl_description = "Remove baked path-factor keyframes from the active track"
+    bl_description = "Remove standalone baked animation and restore live placement and wheel drivers"
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
@@ -2013,17 +2346,25 @@ class COASTERMIXER_OT_clear_baked_simulation(bpy.types.Operator):
         return track_object is not None and has_baked_path_animation(track_object)
 
     def execute(self, context):
-        track_object, _track_settings = resolve_active_track_settings(context)
+        track_object, track_settings = resolve_active_track_settings(context)
         if track_object is None:
             self.report({"WARNING"}, "Select a curve object first")
             return {"CANCELLED"}
 
-        if not clear_action_fcurve(track_object, TRAIN_FRONT_METERS_DATA_PATH):
+        cleared_visuals = clear_standalone_visual_bake(track_object)
+        cleared_front = clear_action_fcurve(track_object, TRAIN_FRONT_METERS_DATA_PATH)
+        clear_action_fcurve(track_object, TRAIN_TRAVEL_DISTANCE_DATA_PATH)
+        if not cleared_front and not cleared_visuals:
             self.report({"WARNING"}, "No baked path-factor keys found")
             return {"CANCELLED"}
 
+        scene_settings = getattr(context.scene, "coaster_mixer_scene", None)
+        invalidate_simulation_trajectory()
+        if scene_settings is not None:
+            assign_simulation_enabled(scene_settings, True)
+            apply_simulation_frame(context.scene, track_object, track_settings)
         context.scene.frame_set(context.scene.frame_current)
-        self.report({"INFO"}, "Cleared baked path-factor keys")
+        self.report({"INFO"}, "Cleared standalone bake and resumed live simulation")
         tag_redraw_view3d()
         return {"FINISHED"}
 
